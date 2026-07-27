@@ -380,9 +380,9 @@ func loadServerModeFromBeadsDir(beadsDir string) error {
 	if beadsDir == "" {
 		return nil
 	}
-	cfg, err := configfile.Load(beadsDir)
+	cfg, err := configfile.LoadForDiscovery(beadsDir)
 	if err != nil {
-		return fmt.Errorf("load %s: %w (storage mode unknown; data commands will refuse to run rather than fall back to the embedded store)", configfile.ConfigPath(beadsDir), err)
+		return fmt.Errorf("load %s: %w; no storage database was opened or modified (storage mode unknown; data commands refuse to fall back to the embedded store)", configfile.ConfigPath(beadsDir), err)
 	}
 	if cfg == nil {
 		return nil
@@ -1075,7 +1075,16 @@ var rootCmd = &cobra.Command{
 
 		if dbPath == "" {
 			if bd := beads.FindBeadsDir(); bd != "" {
-				cfg, cfgErr := configfile.Load(bd)
+				// Bind the discovered target before admission so the legacy guard
+				// honors its config.yaml (including dolt.shared-server), not the
+				// caller's. This setup is read-only: metadata discovery below still
+				// uses LoadForDiscovery and cannot migrate config.json.
+				prepareSelectedCommandContext(bd, true)
+				refreshBoundCommandConfig(cmd)
+				if guardErr := guardLegacyUpgradeWorkspace(bd); guardErr != nil {
+					return HandleError("%v", guardErr)
+				}
+				cfg, cfgErr := configfile.LoadForDiscovery(bd)
 				if cfgErr != nil || cfg != nil && (cfg.IsDoltProxiedServerMode() || !configfile.IsSupportedBackend(cfg.Backend)) {
 					// Proxied-server and removed-backend workspaces may have no
 					// local Dolt database file. Invalid or unknown metadata likewise must
@@ -1084,6 +1093,8 @@ var rootCmd = &cobra.Command{
 					// route or reject it explicitly.
 					dbPath = bd
 				}
+			} else if guardErr := guardUndiscoveredLegacyWorkspace(); guardErr != nil {
+				return HandleError("%v", guardErr)
 			}
 		}
 
@@ -1159,6 +1170,9 @@ var rootCmd = &cobra.Command{
 		beadsDir := resolveCommandBeadsDir(dbPath)
 		prepareSelectedCommandContext(beadsDir, true)
 		refreshBoundCommandConfig(cmd)
+		if guardErr := guardLegacyUpgradeWorkspace(beadsDir); guardErr != nil {
+			return HandleError("%v", guardErr)
+		}
 		if _, err := getDoltAutoCommitMode(); err != nil {
 			return HandleError("%v", err)
 		}

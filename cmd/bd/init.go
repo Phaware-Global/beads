@@ -486,6 +486,11 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 		}
 
 		if initProxiedServer {
+			if beadsDir := resolveInitBeadsDir(); beadsDir != "" {
+				if err := guardLegacyUpgradeWorkspace(beadsDir); err != nil {
+					return err
+				}
+			}
 			if err := runInitProxiedServer(cmd, rootCtx, initProxiedServerInput{
 				prefix:                 prefix,
 				database:               database,
@@ -578,6 +583,15 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 					"  Embedded mode has no host/port — these settings require server mode.\n"+
 					"  Set dolt.mode: server in %s or pass --server to bd init.",
 					detail, hostSource, config.UserConfigYamlPath())
+			}
+		}
+
+		// Historical workspaces need an explicit sealed-copy bridge. This runs
+		// before init's existing-workspace checks so even --force cannot create
+		// or rewrite state beside a source that has not been preserved.
+		if beadsDir := resolveInitBeadsDir(); beadsDir != "" {
+			if err := guardLegacyUpgradeWorkspace(beadsDir); err != nil {
+				return err
 			}
 		}
 
@@ -2184,7 +2198,7 @@ func checkExistingBeadsDataAt(beadsDir string, prefix string) error {
 	// /--force bypass this (handled by the caller). Invalid metadata must fail closed:
 	// without an explicit reinitialization request, init may not overwrite the only
 	// marker for an external or otherwise nonlocal database.
-	cfg, cfgErr := configfile.Load(beadsDir)
+	cfg, cfgErr := configfile.LoadForDiscovery(beadsDir)
 	if cfgErr != nil {
 		return fmt.Errorf("failed to load %s: %w; refusing to reinitialize automatically (restore the metadata or use --reinit-local after safeguarding existing data)", configfile.ConfigPath(beadsDir), cfgErr)
 	}
