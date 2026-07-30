@@ -196,7 +196,7 @@ func generate(path string) error {
 // The proxy protocol says @v/list is newline-delimited and omits pseudo-versions.
 // https://go.dev/ref/mod#goproxy-protocol
 func fetchProxyVersions(ctx context.Context) ([]string, error) {
-	return commandLines(ctx, "curl", "-fsSL", "--max-time", "30", proxyURL+"/github.com/steveyegge/beads/@v/list")
+	return commandLines(ctx, "curl", "-fsSL", "--max-time", "30", proxyURL+"/"+modulePath+"/@v/list")
 }
 
 func fetchGitHubReleases(ctx context.Context) ([]githubRelease, error) {
@@ -366,56 +366,108 @@ func validateCatalog(c Catalog) error {
 	if len(c.Versions) != expectedVersions {
 		return fmt.Errorf("versions = %d, want %d", len(c.Versions), expectedVersions)
 	}
+	seen, byVersion, releases, assets, err := validateVersionEntries(c.Versions)
+	if err != nil {
+		return err
+	}
+	driftSet, driftAssets, err := validateTagDrift(c.RepositoryTagDrift, byVersion)
+	if err != nil {
+		return err
+	}
+	if err := validateSourceRelations(c.Versions, driftSet); err != nil {
+		return err
+	}
+	if !seen["v0.56.0"] || releases != expectedReleases || assets != expectedLinuxAssets ||
+		driftAssets != expectedDriftAssets {
+		return fmt.Errorf("release provenance = %d/%d/%d/%d, want %d/%d/%d/%d",
+			releases, assets, len(driftSet), driftAssets,
+			expectedReleases, expectedLinuxAssets, expectedTagDrift, expectedDriftAssets)
+	}
+	return validateExclusions(c.Exclusions, seen)
+}
+
+// validateVersionEntries checks each catalog version's scope, ordering, and
+// authenticated provenance, returning the seen set, the version index, and the
+// running GitHub release and linux/amd64 asset counts.
+func validateVersionEntries(versions []Entry) (map[string]bool, map[string]Entry, int, int, error) {
 	seen, byVersion, releases, assets := map[string]bool{}, map[string]Entry{}, 0, 0
-	for i, entry := range c.Versions {
+	for i, entry := range versions {
 		if !isStable(entry.Version) || !inScope(entry.Version) || seen[entry.Version] {
-			return fmt.Errorf("invalid or duplicate version %s", entry.Version)
+			return nil, nil, 0, 0, fmt.Errorf("invalid or duplicate version %s", entry.Version)
 		}
-		if i > 0 && versionCompare(c.Versions[i-1].Version, entry.Version) >= 0 {
-			return errors.New("versions are not semantically sorted")
+		if i > 0 && versionCompare(versions[i-1].Version, entry.Version) >= 0 {
+			return nil, nil, 0, 0, errors.New("versions are not semantically sorted")
 		}
 		seen[entry.Version] = true
 		byVersion[entry.Version] = entry
-		if !h1RE.MatchString(entry.Sum) || !h1RE.MatchString(entry.GoModSum) ||
-			!hashRE.MatchString(entry.Origin.Hash) || !strings.HasPrefix(entry.Origin.Ref, "refs/") ||
-			!shaRE.MatchString(entry.SourceZip.SHA256) || entry.SourceZip.Size <= 0 {
-			return fmt.Errorf("%s: invalid authenticated provenance", entry.Version)
+		hasRelease, hasAsset, err := validateEntryProvenance(entry)
+		if err != nil {
+			return nil, nil, 0, 0, err
 		}
-		if entry.GitHubRelease == nil {
-			continue
+		if hasRelease {
+			releases++
 		}
-		releases++
-		r := entry.GitHubRelease
-		if r.HTMLURL != "https://github.com/"+githubRepository+"/releases/tag/"+entry.Version {
-			return fmt.Errorf("%s: invalid release", entry.Version)
+		if hasAsset {
+			assets++
 		}
-		if r.LinuxAMD64Asset == nil {
-			continue
-		}
-		assets++
-		a := r.LinuxAMD64Asset
-		want := "beads_" + strings.TrimPrefix(entry.Version, "v") + "_linux_amd64.tar.gz"
-		if a.Size <= 0 || a.Name != want || !assetRE.MatchString(a.Digest) {
-			return fmt.Errorf("%s: invalid release asset", entry.Version)
-		}
+	}
+	return seen, byVersion, releases, assets, nil
+}
+
+// validateEntryProvenance validates one entry's authenticated sums, origin, and
+// source zip, plus any GitHub release and its linux/amd64 asset. It reports
+// whether the entry carries a release and an asset so the caller can count them.
+func validateEntryProvenance(entry Entry) (hasRelease, hasAsset bool, err error) {
+	if !h1RE.MatchString(entry.Sum) || !h1RE.MatchString(entry.GoModSum) ||
+		!hashRE.MatchString(entry.Origin.Hash) || !strings.HasPrefix(entry.Origin.Ref, "refs/") ||
+		!shaRE.MatchString(entry.SourceZip.SHA256) || entry.SourceZip.Size <= 0 {
+		return false, false, fmt.Errorf("%s: invalid authenticated provenance", entry.Version)
+	}
+	if entry.GitHubRelease == nil {
+		return false, false, nil
+	}
+	r := entry.GitHubRelease
+	if r.HTMLURL != "https://github.com/"+githubRepository+"/releases/tag/"+entry.Version {
+		return false, false, fmt.Errorf("%s: invalid release", entry.Version)
+	}
+	if r.LinuxAMD64Asset == nil {
+		return true, false, nil
+	}
+	a := r.LinuxAMD64Asset
+	want := "beads_" + strings.TrimPrefix(entry.Version, "v") + "_linux_amd64.tar.gz"
+	if a.Size <= 0 || a.Name != want || !assetRE.MatchString(a.Digest) {
+		return true, false, fmt.Errorf("%s: invalid release asset", entry.Version)
+	}
+	return true, true, nil
+}
+
+// validateTagDrift checks the repository tag-drift records against the catalog
+// entries, returning the drifted-version set and the count of drift entries that
+// also carry a linux/amd64 asset.
+func validateTagDrift(driftRecords []TagDrift, byVersion map[string]Entry) (map[string]bool, int, error) {
+	if len(driftRecords) != expectedTagDrift {
+		return nil, 0, fmt.Errorf("repository tag drift = %d, want %d", len(driftRecords), expectedTagDrift)
 	}
 	driftSet, driftAssets := map[string]bool{}, 0
-	if len(c.RepositoryTagDrift) != expectedTagDrift {
-		return fmt.Errorf("repository tag drift = %d, want %d", len(c.RepositoryTagDrift), expectedTagDrift)
-	}
-	for i, drift := range c.RepositoryTagDrift {
+	for i, drift := range driftRecords {
 		entry, ok := byVersion[drift.Version]
 		if !ok || driftSet[drift.Version] || !hashRE.MatchString(drift.CurrentHash) ||
 			drift.CurrentHash == entry.Origin.Hash ||
-			(i > 0 && versionCompare(c.RepositoryTagDrift[i-1].Version, drift.Version) >= 0) {
-			return fmt.Errorf("invalid or unsorted repository tag drift %s", drift.Version)
+			(i > 0 && versionCompare(driftRecords[i-1].Version, drift.Version) >= 0) {
+			return nil, 0, fmt.Errorf("invalid or unsorted repository tag drift %s", drift.Version)
 		}
 		driftSet[drift.Version] = true
 		if entry.GitHubRelease != nil && entry.GitHubRelease.LinuxAMD64Asset != nil {
 			driftAssets++
 		}
 	}
-	for _, entry := range c.Versions {
+	return driftSet, driftAssets, nil
+}
+
+// validateSourceRelations checks that every GitHub release records the source
+// relation implied by whether its version drifted from the proxy origin.
+func validateSourceRelations(versions []Entry, driftSet map[string]bool) error {
+	for _, entry := range versions {
 		if entry.GitHubRelease == nil {
 			continue
 		}
@@ -427,19 +479,19 @@ func validateCatalog(c Catalog) error {
 			return fmt.Errorf("%s: invalid release source relation", entry.Version)
 		}
 	}
-	if !seen["v0.56.0"] || releases != expectedReleases || assets != expectedLinuxAssets ||
-		driftAssets != expectedDriftAssets {
-		return fmt.Errorf("release provenance = %d/%d/%d/%d, want %d/%d/%d/%d",
-			releases, assets, len(driftSet), driftAssets,
-			expectedReleases, expectedLinuxAssets, expectedTagDrift, expectedDriftAssets)
-	}
-	if err := validateExcluded("proxy prereleases", c.Exclusions.ProxyPrereleases, 2, isPrerelease, seen); err != nil {
+	return nil
+}
+
+// validateExclusions checks the proxy-prerelease and repository-only exclusion
+// lists against the included version set.
+func validateExclusions(ex Exclusions, seen map[string]bool) error {
+	if err := validateExcluded("proxy prereleases", ex.ProxyPrereleases, 2, isPrerelease, seen); err != nil {
 		return err
 	}
-	if err := validateExcluded("repository-only stable tags", c.Exclusions.RepositoryOnlyStable, expectedRepoOnly, isStable, seen); err != nil {
+	if err := validateExcluded("repository-only stable tags", ex.RepositoryOnlyStable, expectedRepoOnly, isStable, seen); err != nil {
 		return err
 	}
-	if err := validateExcluded("repository-only prerelease tags", c.Exclusions.RepositoryOnlyPrereleases, expectedRepoPre, isPrerelease, seen); err != nil {
+	if err := validateExcluded("repository-only prerelease tags", ex.RepositoryOnlyPrereleases, expectedRepoPre, isPrerelease, seen); err != nil {
 		return err
 	}
 	return nil
