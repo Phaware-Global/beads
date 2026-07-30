@@ -1935,7 +1935,10 @@ func BenchmarkContentHashColumnProbe(b *testing.B) {
 	b.Run("ShowColumns", func(b *testing.B) {
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
-			rows, err := store.db.QueryContext(ctx, "SHOW COLUMNS FROM schema_migrations LIKE 'content_hash'")
+			// No LIKE: mirrors what hasContentHashColumn actually issues. The
+			// LIKE was dropped because Dolt filters case variants server-side;
+			// benchmarking it would measure a query production no longer runs.
+			rows, err := store.db.QueryContext(ctx, "SHOW COLUMNS FROM schema_migrations")
 			if err != nil {
 				b.Fatalf("show columns probe: %v", err)
 			}

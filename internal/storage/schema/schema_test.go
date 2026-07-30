@@ -1063,7 +1063,14 @@ func TestHasContentHashColumnUsesShowColumns(t *testing.T) {
 		}
 		defer db.Close()
 
-		mock.ExpectQuery(`SHOW COLUMNS FROM schema_migrations`).
+		// ANCHORED (^...$) on purpose: sqlmock's default matcher is an
+		// unanchored regexp, so an unanchored pattern still matches a
+		// LIKE-bearing query and returns the canned rows regardless — which
+		// would let `LIKE 'content_hash'` come back silently while this guard
+		// stayed green. Dropping the LIKE is load-bearing, not cosmetic: real
+		// Dolt filters `Content_Hash` out server-side, so EqualFold below never
+		// sees the row. This anchor is what pins the no-LIKE form.
+		mock.ExpectQuery(`^SHOW COLUMNS FROM schema_migrations$`).
 			WillReturnRows(showColumnsRows("Content_Hash"))
 
 		has, err := mainSource.hasContentHashColumn(context.Background(), db)
@@ -1232,8 +1239,11 @@ WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = '%s' AND COLUMN_NAME = 'content
 	runDoltSQL(t, dir, fmt.Sprintf("ALTER TABLE %s DROP COLUMN Content_Hash", table))
 
 	// State 4: a sibling column that collides with content_hash under LIKE,
-	// where '_' is a single-character wildcard. Guards against reintroducing a
-	// LIKE-based probe that would report a false positive here.
+	// where '_' is a single-character wildcard. NOTE this documents Dolt's
+	// SQL-level behaviour only — it cannot catch a LIKE reintroduced in
+	// production, because showColumnsHas is a test-local helper that no longer
+	// issues one. The guard that actually pins the no-LIKE form is the anchored
+	// expectation in TestHasContentHashColumnUsesShowColumns.
 	runDoltSQL(t, dir, fmt.Sprintf("ALTER TABLE %s ADD COLUMN contentXhash CHAR(64)", table))
 	if showColumnsHas() {
 		t.Fatal("SHOW COLUMNS reported content_hash for a table whose only similar column is contentXhash")
