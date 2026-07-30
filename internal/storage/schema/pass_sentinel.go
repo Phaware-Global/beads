@@ -9,10 +9,19 @@ import (
 	"github.com/steveyegge/beads/internal/storage/dberrors"
 )
 
-// migrationPassCompleteKey is the local_metadata row recording that a COMPLETE
-// MigrateUp pass — numbered migrations, backfills, dependency/aux rekeys,
-// ignored source, final staging commit — has finished against this database,
-// and the "main/ignored" latest versions the completing binary knew.
+// migrationPassCompleteKey is the local_metadata row recording that, as of the
+// stamping binary's "main/ignored" latest versions, this database had no
+// migration work outstanding and no pass in flight.
+//
+// Read that wording precisely — it is what the code guarantees, and it is
+// weaker than "a complete pass ran". MigrateUp stamps after any successful
+// return, which includes migrateUp's no-work short-circuit, where no pass
+// executed at all. That is intentional and sufficient for the fast path (the
+// question it answers is "is a lock-free open safe right now?", not "did a pass
+// ever run here?"), with one carve-out: stampMigrationPassComplete declines to
+// stamp while auxRekeyResumePending reports a pass that died inside the rekey
+// tail, since such a database looks work-free to migrationWorkNeeded but has a
+// demonstrably unfinished tail.
 //
 // It exists for MigrateUpWithLock's lock-free fast path. The probe's other
 // input (migrationWorkNeeded: cursors at-latest, content-hash columns present,
@@ -35,30 +44,49 @@ import (
 // no-op pass to earn it.
 const migrationPassCompleteKey = "migration_pass_complete"
 
-// migrationPassCompleteCurrent reports whether a complete migration pass has
-// finished at or past this binary's latest main and ignored versions. Strictly
-// read-only. A missing local_metadata table, absent row, or unparseable value
-// all report false (not an error): the caller falls through to the locked
-// pass, which re-proves currency and restamps.
-func migrationPassCompleteCurrent(ctx context.Context, db DBConn) (bool, error) {
+// readMigrationPassStamp returns the raw sentinel value, or "" when there is no
+// stamp. Strictly read-only. A missing local_metadata table or absent row both
+// report "" (not an error): the caller falls through to the locked pass, which
+// re-proves currency and restamps.
+//
+// The raw value is returned rather than a bool so callers can compare two reads
+// for equality — see migrationStateCurrent's seqlock-style check, which must
+// distinguish "the same stamp throughout" from "a pass ran in between".
+func readMigrationPassStamp(ctx context.Context, db DBConn) (string, error) {
 	var value string
 	err := db.QueryRowContext(ctx,
 		"SELECT value FROM local_metadata WHERE `key` = ?",
 		migrationPassCompleteKey).Scan(&value)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) || dberrors.IsTableNotExist(err) {
-			return false, nil
+			return "", nil
 		}
-		return false, fmt.Errorf("reading migration pass sentinel: %w", err)
+		return "", fmt.Errorf("reading migration pass sentinel: %w", err)
 	}
+	return value, nil
+}
+
+// stampSatisfies reports whether a raw sentinel value records a pass at or past
+// this binary's latest main and ignored versions. Empty or unparseable is false.
+func stampSatisfies(value string) bool {
 	var mainV, ignoredV int
 	if n, err := fmt.Sscanf(value, "%d/%d", &mainV, &ignoredV); err != nil || n != 2 {
-		return false, nil
+		return false
 	}
 	// >= not ==: a newer binary's completed pass already satisfies this
 	// binary's requirements, so mixed-binary fleets stay monotonic instead of
 	// thrashing the sentinel back and forth.
-	return mainV >= LatestVersion() && ignoredV >= LatestIgnoredVersion(), nil
+	return mainV >= LatestVersion() && ignoredV >= LatestIgnoredVersion()
+}
+
+// migrationPassCompleteCurrent reports whether a pass at or past this binary's
+// latest versions is recorded. Strictly read-only.
+func migrationPassCompleteCurrent(ctx context.Context, db DBConn) (bool, error) {
+	value, err := readMigrationPassStamp(ctx, db)
+	if err != nil {
+		return false, err
+	}
+	return stampSatisfies(value), nil
 }
 
 // clearMigrationPassComplete revokes the fast path before a migration pass's

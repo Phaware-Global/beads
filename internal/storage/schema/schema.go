@@ -267,12 +267,41 @@ func MigrateUpTo(ctx context.Context, db DBConn, maxVersion int) (int, error) {
 // backfills, rekeys, ignored source, final commit — has returned, so a
 // concurrent prober can never fast-path into a half-finished pass; migrateUp
 // itself revokes the sentinel before its first mutation.
+//
+// Stamping is BEST-EFFORT and must stay that way. The sentinel is purely a
+// performance optimization: the only consequence of a missing stamp is that
+// openers keep taking the migration lock, i.e. exactly the pre-fast-path
+// behaviour. Returning its error would make a clone-local bookkeeping write
+// load-bearing for store-open success — and non-self-healing, because on retry
+// migrateUp no-ops and control lands on the same failing write. That would turn
+// a previously zero-write no-op open into a hard failure wherever the write is
+// refused: Dolt's read-only-under-load mode, or a deployment that grants the bd
+// user DML but not CREATE. The read side already fails open (MigrateUpWithLock
+// ignores its probe error); the write side must match.
 func MigrateUp(ctx context.Context, db DBConn) (int, error) {
 	applied, err := migrateUp(ctx, db)
 	if err != nil {
 		return applied, err
 	}
-	return applied, ensureMigrationPassComplete(ctx, db)
+	stampMigrationPassComplete(ctx, db)
+	return applied, nil
+}
+
+// stampMigrationPassComplete records the sentinel, best-effort. It declines to
+// stamp when a previous pass died inside the aux-rekey tail: migrateUp's
+// !needed short-circuit returns success for such a database (cursors are at
+// latest, the backfill ran) without executing the tail, and stamping there
+// would certify a pass that demonstrably never completed.
+func stampMigrationPassComplete(ctx context.Context, db DBConn) {
+	if resuming, err := auxRekeyResumePending(ctx, db); err != nil || resuming {
+		if err != nil {
+			log.Printf("schema: checking aux-rekey resume state before stamping migration pass sentinel (non-fatal): %v", err)
+		}
+		return
+	}
+	if err := ensureMigrationPassComplete(ctx, db); err != nil {
+		log.Printf("schema: recording migration pass sentinel (non-fatal): %v", err)
+	}
 }
 
 func migrateUp(ctx context.Context, db DBConn) (int, error) {
@@ -503,22 +532,45 @@ func wispDependenciesNeed0053Repair(ctx context.Context, db DBConn) (bool, error
 // read-only, so any number of concurrent processes can probe it without
 // coordination — the basis for MigrateUpWithLock's lock-free fast path.
 //
-// The sentinel check is first and is the concurrency barrier: migrationWorkNeeded
-// is satisfied mid-pass by a running migration's per-step commits (before its
-// rekey tail and final commit), so on its own it would admit a lock-free open
-// while another process's pass is still rewriting rows. migrationWorkNeeded
-// stays ANDed in because the sentinel alone cannot see out-of-band regressions
-// (a table copy that rewound the cursors leaves local_metadata untouched).
+// The sentinel is the concurrency barrier: migrationWorkNeeded is satisfied
+// mid-pass by a running migration's per-step commits (before its rekey tail and
+// final commit), so on its own it would admit a lock-free open while another
+// process's pass is still rewriting rows. migrationWorkNeeded stays ANDed in
+// because the sentinel alone cannot see out-of-band regressions (a table copy
+// that rewound the cursors leaves local_metadata untouched).
+//
+// SEQLOCK ORDERING — load-bearing, and the reason the sentinel is read twice.
+// These are independent autocommitted round trips with no shared snapshot, so
+// ordering is the only synchronization available. The mutator's order is
+// DELETE-then-mutate (migrateUp). A prober that read the sentinel FIRST could
+// see a live stamp, have a pass start and revoke it, then read
+// migrationWorkNeeded as false — false precisely because that pass's own
+// per-step commits made it so — and fast-path straight into the in-flight rekey
+// tail. That is the exact window the sentinel exists to close.
+//
+// So: read the stamp, read the mutation-derived state, then re-read the stamp,
+// and require both reads to return the identical satisfying value. A pass that
+// began anywhere in that window revoked the stamp before its first mutation, so
+// the second read returns "" (or a different value once it restamps) and we
+// fall through to the lock.
 func migrationStateCurrent(ctx context.Context, db DBConn) (bool, error) {
-	passComplete, err := migrationPassCompleteCurrent(ctx, db)
-	if err != nil || !passComplete {
+	before, err := readMigrationPassStamp(ctx, db)
+	if err != nil || !stampSatisfies(before) {
 		return false, err
 	}
 	needed, err := migrationWorkNeeded(ctx, db)
+	if err != nil || needed {
+		return false, err
+	}
+	after, err := readMigrationPassStamp(ctx, db)
 	if err != nil {
 		return false, err
 	}
-	return !needed, nil
+	// Identical, not merely both-satisfying: a pass that ran to completion
+	// inside the window restamps, and its value may differ (a newer binary
+	// bumps the versions). Requiring equality rejects that case outright rather
+	// than reasoning about whether the intervening pass happened to finish.
+	return after == before, nil
 }
 
 func migrationWorkNeeded(ctx context.Context, db DBConn) (bool, error) {

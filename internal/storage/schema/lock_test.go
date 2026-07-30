@@ -187,8 +187,10 @@ func TestMigrateUpWithLockSkipsLockWhenCurrent(t *testing.T) {
 	}
 	defer conn.Close()
 
+	// Seqlock read order: stamp, mutation-derived state, stamp again.
 	expectPassSentinelCurrent(mock)
 	expectNoMigrationWork(mock)
+	expectPassSentinelCurrent(mock)
 
 	applied, err := MigrateUpWithLock(ctx, conn, "testdb")
 	if err != nil {
@@ -196,6 +198,74 @@ func TestMigrateUpWithLockSkipsLockWhenCurrent(t *testing.T) {
 	}
 	if applied != 0 {
 		t.Fatalf("MigrateUpWithLock() applied = %d, want 0", applied)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet SQL expectations: %v", err)
+	}
+}
+
+// TestMigrateUpWithLockLocksWhenSentinelRevokedMidProbe covers the interleaving
+// the seqlock exists for: the prober reads a live stamp, another process then
+// starts a pass (revoking the stamp before its first mutation) whose own
+// per-step commits make migrationWorkNeeded false, and the prober must NOT
+// fast-path into that in-flight pass. Reading the stamp a second time is what
+// catches it.
+func TestMigrateUpWithLockLocksWhenSentinelRevokedMidProbe(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("create sql mock: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatalf("pin mock connection: %v", err)
+	}
+	defer conn.Close()
+
+	expectPassSentinelCurrent(mock) // read 1: stamp present
+	expectNoMigrationWork(mock)     // work-needed false — the in-flight pass made it so
+	expectPassSentinelAbsent(mock)  // read 2: the pass revoked it
+	// Must fall through to the lock; a contended acquisition ends the test.
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT GET_LOCK(?, ?)")).
+		WithArgs(MigrationLockName("testdb"), migrationLockAcquireTimeoutSeconds).
+		WillReturnRows(sqlmock.NewRows([]string{"locked"}).AddRow(0))
+
+	if _, err := MigrateUpWithLock(ctx, conn, "testdb"); !errors.Is(err, ErrMigrationLockUnavailable) {
+		t.Fatalf("MigrateUpWithLock() error = %v, want ErrMigrationLockUnavailable — "+
+			"a stamp revoked mid-probe must force the locked path, not a lock-free open into an in-flight pass", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet SQL expectations: %v", err)
+	}
+}
+
+// TestMigrateUpSucceedsWhenSentinelWriteFails pins the best-effort contract:
+// the sentinel is a performance optimization, so a refused clone-local write
+// (Dolt read-only mode, or a bd user without CREATE) must not turn a
+// zero-work open into a hard, non-self-healing failure.
+func TestMigrateUpSucceedsWhenSentinelWriteFails(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("create sql mock: %v", err)
+	}
+	defer db.Close()
+
+	expectNoMigrationWork(mock) // migrateUp short-circuits: nothing to do
+	// Stamp path: resume check, probe, then a CREATE that the server refuses.
+	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES`).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+	expectPassSentinelAbsent(mock)
+	mock.ExpectExec("(?s)^CREATE TABLE IF NOT EXISTS local_metadata").
+		WillReturnError(errors.New("Access denied; you need the CREATE privilege"))
+
+	applied, err := MigrateUp(context.Background(), db)
+	if err != nil {
+		t.Fatalf("MigrateUp() error = %v; a failed sentinel write must not fail the open", err)
+	}
+	if applied != 0 {
+		t.Fatalf("MigrateUp() applied = %d, want 0", applied)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet SQL expectations: %v", err)
@@ -362,9 +432,12 @@ func expectPassSentinelRevoke(mock sqlmock.Sqlmock) {
 		WillReturnResult(sqlmock.NewResult(0, 0))
 }
 
-// expectPassSentinelStamp matches the post-pass stamp: probe (absent), create
-// the clone-local table on demand, write the row.
+// expectPassSentinelStamp matches the post-pass stamp: the aux-rekey resume
+// check (no local_metadata table here, so no crashed pass), then probe
+// (absent), create the clone-local table on demand, write the row.
 func expectPassSentinelStamp(mock sqlmock.Sqlmock) {
+	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES`).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
 	expectPassSentinelAbsent(mock)
 	mock.ExpectExec("(?s)^CREATE TABLE IF NOT EXISTS local_metadata").
 		WillReturnResult(sqlmock.NewResult(0, 0))
