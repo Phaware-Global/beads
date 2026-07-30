@@ -22,7 +22,7 @@ func TestEnsureContentHashColumnAddsWhenMissing(t *testing.T) {
 	}
 	defer db.Close()
 
-	mock.ExpectQuery(`SHOW COLUMNS FROM schema_migrations LIKE 'content_hash'`).
+	mock.ExpectQuery(`SHOW COLUMNS FROM schema_migrations`).
 		WillReturnRows(showColumnsRows())
 	mock.ExpectExec(`ALTER TABLE schema_migrations ADD COLUMN content_hash CHAR\(64\)`).
 		WillReturnResult(sqlmock.NewResult(0, 0))
@@ -48,7 +48,7 @@ func TestEnsureContentHashColumnNoOpWhenPresent(t *testing.T) {
 	}
 	defer db.Close()
 
-	mock.ExpectQuery(`SHOW COLUMNS FROM schema_migrations LIKE 'content_hash'`).
+	mock.ExpectQuery(`SHOW COLUMNS FROM schema_migrations`).
 		WillReturnRows(showColumnsRows("content_hash"))
 	// No ExpectExec: an ALTER here would be an unexpected call.
 
@@ -112,7 +112,7 @@ func TestMigrationWorkNeededAddsContentHashColumnOnUpToDateDB(t *testing.T) {
 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM schema_migrations", "version", LatestVersion())
 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations", "version", LatestIgnoredVersion())
 	// ...but schema_migrations predates the content_hash column.
-	mock.ExpectQuery(`SHOW COLUMNS FROM schema_migrations LIKE 'content_hash'`).
+	mock.ExpectQuery(`SHOW COLUMNS FROM schema_migrations`).
 		WillReturnRows(showColumnsRows())
 
 	needed, err := migrationWorkNeeded(context.Background(), db)
@@ -140,9 +140,9 @@ func TestMigrationWorkNotNeededWhenContentHashColumnsPresent(t *testing.T) {
 
 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM schema_migrations", "version", LatestVersion())
 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations", "version", LatestIgnoredVersion())
-	mock.ExpectQuery(`SHOW COLUMNS FROM schema_migrations LIKE 'content_hash'`).
+	mock.ExpectQuery(`SHOW COLUMNS FROM schema_migrations`).
 		WillReturnRows(showColumnsRows("content_hash"))
-	mock.ExpectQuery(`SHOW COLUMNS FROM ignored_schema_migrations LIKE 'content_hash'`).
+	mock.ExpectQuery(`SHOW COLUMNS FROM ignored_schema_migrations`).
 		WillReturnRows(showColumnsRows("content_hash"))
 	// No backfill pending (custom tables already populated).
 	expectScalar(mock, "SELECT COUNT(*) FROM custom_types", "count", 1)

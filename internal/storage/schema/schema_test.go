@@ -1035,7 +1035,7 @@ func TestHasContentHashColumnUsesShowColumns(t *testing.T) {
 		}
 		defer db.Close()
 
-		mock.ExpectQuery(`SHOW COLUMNS FROM schema_migrations LIKE 'content_hash'`).
+		mock.ExpectQuery(`SHOW COLUMNS FROM schema_migrations`).
 			WillReturnRows(showColumnsRows("content_hash"))
 
 		has, err := mainSource.hasContentHashColumn(context.Background(), db)
@@ -1047,6 +1047,53 @@ func TestHasContentHashColumnUsesShowColumns(t *testing.T) {
 		}
 		if err := mock.ExpectationsWereMet(); err != nil {
 			t.Fatalf("unmet sql expectations: %v", err)
+		}
+	})
+
+	// Regression guard for the case-sensitivity hazard: column names are
+	// case-insensitive identifiers in MySQL/Dolt, and the retired
+	// INFORMATION_SCHEMA predicate matched them under a case-insensitive
+	// collation. A byte-exact compare here reports absent, and
+	// ensureContentHashColumn then ALTERs a column that already exists — a
+	// non-retryable failure that wedges every store open.
+	t.Run("column present in a different case", func(t *testing.T) {
+		db, mock, err := sqlmock.New()
+		if err != nil {
+			t.Fatalf("sqlmock.New: %v", err)
+		}
+		defer db.Close()
+
+		mock.ExpectQuery(`SHOW COLUMNS FROM schema_migrations`).
+			WillReturnRows(showColumnsRows("Content_Hash"))
+
+		has, err := mainSource.hasContentHashColumn(context.Background(), db)
+		if err != nil {
+			t.Fatalf("hasContentHashColumn: %v", err)
+		}
+		if !has {
+			t.Fatal("has = false for a column declared as Content_Hash; the probe must match case-insensitively")
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Fatalf("unmet sql expectations: %v", err)
+		}
+	})
+
+	// The embedded-Dolt driver does not go through the wire handler that
+	// assigns 1146; it surfaces go-mysql-server's raw sql.ErrTableNotFound
+	// text. dberrors.IsTableNotExist does not match that form, so this branch
+	// must use MissingMigrationObjectErr.
+	t.Run("embedded-driver missing table reports false without error", func(t *testing.T) {
+		db, mock, _ := sqlmock.New()
+		defer db.Close()
+		mock.ExpectQuery(`SHOW COLUMNS FROM schema_migrations`).
+			WillReturnError(errors.New("table not found: schema_migrations"))
+
+		has, err := mainSource.hasContentHashColumn(context.Background(), db)
+		if err != nil {
+			t.Fatalf("hasContentHashColumn returned error for the embedded driver's missing-table form, want nil: %v", err)
+		}
+		if has {
+			t.Fatal("has = true, want false for a missing table")
 		}
 	})
 
@@ -1134,14 +1181,16 @@ FROM INFORMATION_SCHEMA.COLUMNS
 WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = '%s' AND COLUMN_NAME = 'content_hash'`, table))
 		return len(rows) == 1 && rows[0]["cnt"] == "1"
 	}
-	// The new probe: SHOW COLUMNS ... LIKE, matching the Field name exactly.
+	// The new probe, mirroring production (hasContentHashColumn): no LIKE, and
+	// read ONLY the Field column, case-insensitively. Scanning every cell of
+	// every row — as an earlier version of this helper did — can match on
+	// Type/Default text and would hide exactly the divergences States 3 and 4
+	// exist to catch.
 	showColumnsHas := func() bool {
-		rows := queryDoltCSV(t, dir, fmt.Sprintf("SHOW COLUMNS FROM %s LIKE 'content_hash'", table))
+		rows := queryDoltCSV(t, dir, fmt.Sprintf("SHOW COLUMNS FROM %s", table))
 		for _, r := range rows {
-			for _, v := range r {
-				if v == "content_hash" {
-					return true
-				}
+			if strings.EqualFold(r["Field"], "content_hash") {
+				return true
 			}
 		}
 		return false
@@ -1164,5 +1213,32 @@ WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = '%s' AND COLUMN_NAME = 'content
 	}
 	if got, want := showColumnsHas(), infoSchemaHas(); got != want {
 		t.Fatalf("without content_hash: SHOW COLUMNS=%v, INFORMATION_SCHEMA=%v", got, want)
+	}
+
+	// State 3: the column declared in a different case. Column names are
+	// case-insensitive identifiers in MySQL/Dolt, so this is a legitimate
+	// spelling that every other beads query still matches. The retired
+	// INFORMATION_SCHEMA predicate matched it via a case-insensitive collation;
+	// a case-sensitive replacement reports absent here, and the resulting ALTER
+	// fails with "column already exists", permanently wedging every store open.
+	runDoltSQL(t, dir, fmt.Sprintf("ALTER TABLE %s ADD COLUMN Content_Hash CHAR(64)", table))
+	if !showColumnsHas() {
+		t.Fatal("SHOW COLUMNS reported no content_hash for a column declared as Content_Hash; " +
+			"the probe must match case-insensitively or ensureContentHashColumn will ALTER a column that already exists")
+	}
+	if got, want := showColumnsHas(), infoSchemaHas(); got != want {
+		t.Fatalf("with Content_Hash: SHOW COLUMNS=%v, INFORMATION_SCHEMA=%v", got, want)
+	}
+	runDoltSQL(t, dir, fmt.Sprintf("ALTER TABLE %s DROP COLUMN Content_Hash", table))
+
+	// State 4: a sibling column that collides with content_hash under LIKE,
+	// where '_' is a single-character wildcard. Guards against reintroducing a
+	// LIKE-based probe that would report a false positive here.
+	runDoltSQL(t, dir, fmt.Sprintf("ALTER TABLE %s ADD COLUMN contentXhash CHAR(64)", table))
+	if showColumnsHas() {
+		t.Fatal("SHOW COLUMNS reported content_hash for a table whose only similar column is contentXhash")
+	}
+	if got, want := showColumnsHas(), infoSchemaHas(); got != want {
+		t.Fatalf("with contentXhash only: SHOW COLUMNS=%v, INFORMATION_SCHEMA=%v", got, want)
 	}
 }

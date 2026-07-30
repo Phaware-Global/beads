@@ -176,7 +176,7 @@ func expectColumnExists(mock sqlmock.Sqlmock, present bool) {
 // runs). The probe is a single-table SHOW COLUMNS, not an
 // INFORMATION_SCHEMA scan.
 func expectContentHashColumnExists(mock sqlmock.Sqlmock) {
-	mock.ExpectQuery(`SHOW COLUMNS FROM \w+ LIKE 'content_hash'`).
+	mock.ExpectQuery(`SHOW COLUMNS FROM \w+`).
 		WillReturnRows(showColumnsRows("content_hash"))
 }
 
