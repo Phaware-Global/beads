@@ -287,12 +287,26 @@ func MigrateUp(ctx context.Context, db DBConn) (int, error) {
 	return applied, nil
 }
 
-// stampMigrationPassComplete records the sentinel, best-effort. It declines to
-// stamp when a previous pass died inside the aux-rekey tail: migrateUp's
-// !needed short-circuit returns success for such a database (cursors are at
-// latest, the backfill ran) without executing the tail, and stamping there
-// would certify a pass that demonstrably never completed.
+// stampMigrationPassComplete records the sentinel, best-effort.
+//
+// It declines to stamp when setAuxRekeyInProgress's marker shows a previous pass
+// died inside rekeyAuxRowIDs: migrateUp's !needed short-circuit returns success
+// for such a database (cursors at latest, backfill done) without executing the
+// tail, so stamping would certify a pass that never completed.
+//
+// KNOWN GAP, stated rather than implied: that marker is written only by
+// rekeyAuxRowIDs. A pass that died inside rekeyDependencyIDs — which runs
+// earlier, before any marker exists — leaves no trace, so such a database still
+// gets stamped. The consequence is bounded (the stamp only gates lock-skipping,
+// and no pass can be in flight in that state), but the carve-out is narrower
+// than "died inside the rekey tail" and the docs must not claim otherwise.
+// Closing it properly needs an in-progress marker for rekeyDependencyIDs.
+//
+// A refused write latches: see sentinelUnwritable.
 func stampMigrationPassComplete(ctx context.Context, db DBConn) {
+	if sentinelUnwritable.Load() {
+		return
+	}
 	if resuming, err := auxRekeyResumePending(ctx, db); err != nil || resuming {
 		if err != nil {
 			log.Printf("schema: checking aux-rekey resume state before stamping migration pass sentinel (non-fatal): %v", err)
@@ -300,7 +314,10 @@ func stampMigrationPassComplete(ctx context.Context, db DBConn) {
 		return
 	}
 	if err := ensureMigrationPassComplete(ctx, db); err != nil {
-		log.Printf("schema: recording migration pass sentinel (non-fatal): %v", err)
+		// Latch before logging so this is said once, not on every open forever.
+		if sentinelUnwritable.CompareAndSwap(false, true) {
+			log.Printf("schema: recording migration pass sentinel (non-fatal, will not retry this process): %v", err)
+		}
 	}
 }
 

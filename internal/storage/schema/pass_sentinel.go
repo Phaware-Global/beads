@@ -5,9 +5,21 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strconv"
+	"strings"
+	"sync/atomic"
 
 	"github.com/steveyegge/beads/internal/storage/dberrors"
 )
+
+// sentinelUnwritable latches when a stamp write is refused, so the attempt and
+// its log line happen at most once per process. On the deployments the
+// best-effort stamp was written for — Dolt read-only-under-load, or a bd user
+// without CREATE — the write can never succeed, and without this latch every
+// single `bd` invocation would re-issue the refused write and print to stderr
+// forever. Losing the stamp for the process's lifetime costs one GET_LOCK per
+// open, which the design already accepts.
+var sentinelUnwritable atomic.Bool
 
 // migrationPassCompleteKey is the local_metadata row recording that, as of the
 // stamping binary's "main/ignored" latest versions, this database had no
@@ -19,9 +31,9 @@ import (
 // executed at all. That is intentional and sufficient for the fast path (the
 // question it answers is "is a lock-free open safe right now?", not "did a pass
 // ever run here?"), with one carve-out: stampMigrationPassComplete declines to
-// stamp while auxRekeyResumePending reports a pass that died inside the rekey
-// tail, since such a database looks work-free to migrationWorkNeeded but has a
-// demonstrably unfinished tail.
+// stamp while auxRekeyResumePending reports a pass that died inside the AUX rekey
+// tail (rekeyAuxRowIDs only — see the known gap on stampMigrationPassComplete),
+// since such a database looks work-free to migrationWorkNeeded.
 //
 // It exists for MigrateUpWithLock's lock-free fast path. The probe's other
 // input (migrationWorkNeeded: cursors at-latest, content-hash columns present,
@@ -68,9 +80,24 @@ func readMigrationPassStamp(ctx context.Context, db DBConn) (string, error) {
 
 // stampSatisfies reports whether a raw sentinel value records a pass at or past
 // this binary's latest main and ignored versions. Empty or unparseable is false.
+//
+// Parsed strictly, NOT with Sscanf: Sscanf stops at the end of its last verb and
+// never asserts the input is exhausted, so " 63/12", "63/12\n" and "63/12<junk>"
+// would all parse cleanly. local_metadata is a general-purpose key/value store
+// that SetLocalMetadata, SetLocalMetadataInTx and `bd sql` can all write, so a
+// truncated or concatenated value that merely BEGINS with two integers must not
+// certify the lock-free path for every process that reads it.
 func stampSatisfies(value string) bool {
-	var mainV, ignoredV int
-	if n, err := fmt.Sscanf(value, "%d/%d", &mainV, &ignoredV); err != nil || n != 2 {
+	parts := strings.Split(value, "/")
+	if len(parts) != 2 {
+		return false
+	}
+	mainV, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return false
+	}
+	ignoredV, err := strconv.Atoi(parts[1])
+	if err != nil {
 		return false
 	}
 	// >= not ==: a newer binary's completed pass already satisfies this
@@ -114,7 +141,17 @@ func ensureMigrationPassComplete(ctx context.Context, db DBConn) error {
 	if err != nil || current {
 		return err
 	}
-	if err := ensureLocalMetadataTable(ctx, db); err != nil {
+	// Deliberately does NOT create local_metadata — the same rule
+	// clearMigrationPassComplete follows, and for the same reason. Materializing
+	// this dolt-ignored (hence perpetually untracked) table on a path that
+	// previously issued zero writes surfaces it to migrateUp's dirty-table
+	// guards: dirtyBeforeAll includes dolt-ignored tables, and ignored migration
+	// 0001 contains "RENAME TABLE __temp__local_metadata TO local_metadata",
+	// which migrationSQLTouchesTable matches — producing an untyped hard error
+	// that no caller tolerates, before ignoredSource.migrate can advance the
+	// cursor that would clear it. A database without the table simply pays one
+	// GET_LOCK per open until a real pass creates it.
+	if exists, err := localMetadataExists(ctx, db); err != nil || !exists {
 		return err
 	}
 	if _, err := db.ExecContext(ctx,
@@ -124,6 +161,19 @@ func ensureMigrationPassComplete(ctx context.Context, db DBConn) error {
 		return fmt.Errorf("recording migration pass sentinel: %w", err)
 	}
 	return nil
+}
+
+// localMetadataExists reports whether the clone-local metadata table is present.
+// Read-only, and the reason the stamp path never has to create it.
+func localMetadataExists(ctx context.Context, db DBConn) (bool, error) {
+	var n int
+	if err := db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES
+		 WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'local_metadata'`,
+	).Scan(&n); err != nil {
+		return false, err
+	}
+	return n > 0, nil
 }
 
 // ensureLocalMetadataTable creates the clone-local metadata table on demand

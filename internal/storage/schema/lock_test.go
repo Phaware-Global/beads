@@ -252,13 +252,22 @@ func TestMigrateUpSucceedsWhenSentinelWriteFails(t *testing.T) {
 	}
 	defer db.Close()
 
+	sentinelUnwritable.Store(false)
+	t.Cleanup(func() { sentinelUnwritable.Store(false) })
+
 	expectNoMigrationWork(mock) // migrateUp short-circuits: nothing to do
-	// Stamp path: resume check, probe, then a CREATE that the server refuses.
+	// Stamp path: resume check (table present, no marker), stamp probe,
+	// table-exists probe, then a write the server refuses.
 	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES`).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT COUNT(*) FROM local_metadata WHERE `key` = ?")).
+		WithArgs(auxRowRekeyInProgressKey).
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
 	expectPassSentinelAbsent(mock)
-	mock.ExpectExec("(?s)^CREATE TABLE IF NOT EXISTS local_metadata").
-		WillReturnError(errors.New("Access denied; you need the CREATE privilege"))
+	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES`).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+	mock.ExpectExec(regexp.QuoteMeta("REPLACE INTO local_metadata")).
+		WillReturnError(errors.New("database is read only"))
 
 	applied, err := MigrateUp(context.Background(), db)
 	if err != nil {
@@ -435,12 +444,21 @@ func expectPassSentinelRevoke(mock sqlmock.Sqlmock) {
 // expectPassSentinelStamp matches the post-pass stamp: the aux-rekey resume
 // check (no local_metadata table here, so no crashed pass), then probe
 // (absent), create the clone-local table on demand, write the row.
+// Against a database that already has local_metadata: aux-rekey resume check
+// (table present, no marker -> no crashed pass), stamp probe (absent),
+// table-exists probe, write. There is deliberately NO CREATE TABLE — the stamp
+// never materializes local_metadata, mirroring clearMigrationPassComplete.
 func expectPassSentinelStamp(mock sqlmock.Sqlmock) {
+	// auxRekeyResumePending
 	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES`).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT COUNT(*) FROM local_metadata WHERE `key` = ?")).
+		WithArgs(auxRowRekeyInProgressKey).
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+	// ensureMigrationPassComplete
 	expectPassSentinelAbsent(mock)
-	mock.ExpectExec("(?s)^CREATE TABLE IF NOT EXISTS local_metadata").
-		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES`).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
 	mock.ExpectExec(regexp.QuoteMeta("REPLACE INTO local_metadata (`key`, value) VALUES (?, ?)")).
 		WithArgs(migrationPassCompleteKey, sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(0, 1))
@@ -469,4 +487,90 @@ func expectScalar(mock sqlmock.Sqlmock, query, column string, value any) {
 func expectDoltStatusRows(mock sqlmock.Sqlmock) {
 	mock.ExpectQuery("(?s)SELECT s\\.table_name, s\\.staged\\s+FROM dolt_status s").
 		WillReturnRows(sqlmock.NewRows([]string{"table_name", "staged"}))
+}
+
+// TestStampDoesNotMaterializeLocalMetadata pins the rule that the stamp never
+// creates local_metadata. Materializing this dolt-ignored table on a path that
+// previously issued zero writes surfaces it to migrateUp's dirty-table guards,
+// which is a hard, non-self-healing error.
+func TestStampDoesNotMaterializeLocalMetadata(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+	sentinelUnwritable.Store(false)
+	t.Cleanup(func() { sentinelUnwritable.Store(false) })
+
+	expectNoMigrationWork(mock)
+	// auxRekeyResumePending: no local_metadata table at all.
+	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES`).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+	expectPassSentinelAbsent(mock)
+	// localMetadataExists: still absent -> must stop here.
+	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES`).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+	// No CREATE and no REPLACE are registered: either would be an unexpected call.
+
+	if _, err := MigrateUp(context.Background(), db); err != nil {
+		t.Fatalf("MigrateUp() error = %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet SQL expectations: %v", err)
+	}
+}
+
+// TestSentinelWriteRefusalLatches pins that a refused write is attempted once
+// per process, not on every open forever. Without the latch, deployments where
+// the write can never succeed would re-issue it and log to stderr on every
+// single bd invocation.
+func TestSentinelWriteRefusalLatches(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+	sentinelUnwritable.Store(false)
+	t.Cleanup(func() { sentinelUnwritable.Store(false) })
+
+	// First open: full stamp attempt, refused.
+	expectNoMigrationWork(mock)
+	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES`).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT COUNT(*) FROM local_metadata WHERE `key` = ?")).
+		WithArgs(auxRowRekeyInProgressKey).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+	expectPassSentinelAbsent(mock)
+	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES`).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+	mock.ExpectExec(regexp.QuoteMeta("REPLACE INTO local_metadata")).
+		WillReturnError(errors.New("database is read only"))
+	// Second open: ONLY the work probe. Any sentinel query here is unexpected.
+	expectNoMigrationWork(mock)
+
+	for i := 0; i < 2; i++ {
+		if _, err := MigrateUp(context.Background(), db); err != nil {
+			t.Fatalf("MigrateUp() call %d error = %v", i+1, err)
+		}
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet SQL expectations: %v", err)
+	}
+}
+
+func TestStampSatisfiesRejectsTrailingGarbage(t *testing.T) {
+	good := fmt.Sprintf("%d/%d", LatestVersion(), LatestIgnoredVersion())
+	if !stampSatisfies(good) {
+		t.Fatalf("stampSatisfies(%q) = false, want true", good)
+	}
+	for _, bad := range []string{
+		" " + good,    // leading whitespace
+		good + "\n",   // trailing newline
+		good + "junk", // trailing bytes
+		good + "/7",   // extra separator
+	} {
+		if stampSatisfies(bad) {
+			t.Fatalf("stampSatisfies(%q) = true; a corrupted stamp must not certify the fast path", bad)
+		}
+	}
 }
