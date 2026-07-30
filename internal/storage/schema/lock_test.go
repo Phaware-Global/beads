@@ -3,6 +3,7 @@ package schema
 import (
 	"context"
 	"errors"
+	"fmt"
 	"regexp"
 	"strings"
 	"testing"
@@ -75,6 +76,9 @@ func TestMigrateUpWithLockUsesDatabaseScopedLockOnly(t *testing.T) {
 	defer conn.Close()
 
 	lockName := MigrationLockName("testdb")
+	// The lock-free fast path probes first; no sentinel here, so it falls
+	// through and the lock is taken exactly as before.
+	expectPassSentinelAbsent(mock)
 	mock.ExpectQuery(regexp.QuoteMeta("SELECT GET_LOCK(?, ?)")).
 		WithArgs(lockName, migrationLockAcquireTimeoutSeconds).
 		WillReturnRows(sqlmock.NewRows([]string{"locked"}).AddRow(1))
@@ -102,6 +106,9 @@ func expectOnePendingMigration(t *testing.T, mock sqlmock.Sqlmock) {
 	latestIgnored := LatestIgnoredVersion()
 
 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM schema_migrations", "version", latest-1)
+	// migrateUp revokes the pass-completion sentinel before its first mutation
+	// so no concurrent prober can fast-path into a half-finished pass.
+	expectPassSentinelRevoke(mock)
 	expectDoltStatusRows(mock)
 	expectDoltStatusRows(mock)
 	// MigrateUp probes the aux-rekey crash sentinel (bd-578h9.16); this
@@ -158,6 +165,212 @@ func expectOnePendingMigration(t *testing.T, mock sqlmock.Sqlmock) {
 		WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec(regexp.QuoteMeta("CALL DOLT_COMMIT('-m', 'schema: apply migrations')")).
 		WillReturnResult(sqlmock.NewResult(0, 0))
+	// MigrateUp restamps the sentinel only after the whole pass has returned.
+	expectPassSentinelStamp(mock)
+}
+
+// TestMigrateUpWithLockSkipsLockWhenCurrent is the point of the fast path: a
+// fully-migrated database with a complete-pass sentinel must not touch
+// GET_LOCK at all. No lock expectation is registered, so any acquisition
+// attempt shows up as an unexpected query.
+func TestMigrateUpWithLockSkipsLockWhenCurrent(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("create sql mock: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatalf("pin mock connection: %v", err)
+	}
+	defer conn.Close()
+
+	expectPassSentinelCurrent(mock)
+	expectNoMigrationWork(mock)
+
+	applied, err := MigrateUpWithLock(ctx, conn, "testdb")
+	if err != nil {
+		t.Fatalf("MigrateUpWithLock() error = %v", err)
+	}
+	if applied != 0 {
+		t.Fatalf("MigrateUpWithLock() applied = %d, want 0", applied)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet SQL expectations: %v", err)
+	}
+}
+
+// TestMigrateUpWithLockLocksWhenPassSentinelStale proves the sentinel is
+// version-aware: a stamp from an older binary must not satisfy this one, so
+// the open falls through to the lock.
+func TestMigrateUpWithLockLocksWhenPassSentinelStale(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("create sql mock: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatalf("pin mock connection: %v", err)
+	}
+	defer conn.Close()
+
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT value FROM local_metadata WHERE `key` = ?")).
+		WithArgs(migrationPassCompleteKey).
+		WillReturnRows(sqlmock.NewRows([]string{"value"}).
+			AddRow(fmt.Sprintf("%d/%d", LatestVersion()-1, LatestIgnoredVersion())))
+	// Falls through to the lock; a contended acquisition ends the test early.
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT GET_LOCK(?, ?)")).
+		WithArgs(MigrationLockName("testdb"), migrationLockAcquireTimeoutSeconds).
+		WillReturnRows(sqlmock.NewRows([]string{"locked"}).AddRow(0))
+
+	if _, err := MigrateUpWithLock(ctx, conn, "testdb"); !errors.Is(err, ErrMigrationLockUnavailable) {
+		t.Fatalf("MigrateUpWithLock() error = %v, want ErrMigrationLockUnavailable (proving it tried to lock)", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet SQL expectations: %v", err)
+	}
+}
+
+// TestMigrateUpWithLockFallsThroughOnProbeError pins the deliberate choice to
+// treat a probe failure as "not current" rather than as an error: the locked
+// path is the authority, and a transient read failure must not turn a healthy
+// open into a hard failure.
+func TestMigrateUpWithLockFallsThroughOnProbeError(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("create sql mock: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatalf("pin mock connection: %v", err)
+	}
+	defer conn.Close()
+
+	probeErr := errors.New("transient read failure")
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT value FROM local_metadata WHERE `key` = ?")).
+		WithArgs(migrationPassCompleteKey).
+		WillReturnError(probeErr)
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT GET_LOCK(?, ?)")).
+		WithArgs(MigrationLockName("testdb"), migrationLockAcquireTimeoutSeconds).
+		WillReturnRows(sqlmock.NewRows([]string{"locked"}).AddRow(0))
+
+	_, err = MigrateUpWithLock(ctx, conn, "testdb")
+	if errors.Is(err, probeErr) {
+		t.Fatalf("MigrateUpWithLock() surfaced the probe error %v; it must fall through to the lock instead", err)
+	}
+	if !errors.Is(err, ErrMigrationLockUnavailable) {
+		t.Fatalf("MigrateUpWithLock() error = %v, want ErrMigrationLockUnavailable", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet SQL expectations: %v", err)
+	}
+}
+
+func TestMigrationPassCompleteCurrentRejectsUnusableStamps(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		value string
+	}{
+		{"unparseable", "garbage"},
+		{"missing ignored half", fmt.Sprintf("%d", LatestVersion())},
+		{"main behind", fmt.Sprintf("%d/%d", LatestVersion()-1, LatestIgnoredVersion())},
+		{"ignored behind", fmt.Sprintf("%d/%d", LatestVersion(), LatestIgnoredVersion()-1)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db, mock, err := sqlmock.New()
+			if err != nil {
+				t.Fatalf("create sql mock: %v", err)
+			}
+			defer db.Close()
+			mock.ExpectQuery(regexp.QuoteMeta("SELECT value FROM local_metadata WHERE `key` = ?")).
+				WithArgs(migrationPassCompleteKey).
+				WillReturnRows(sqlmock.NewRows([]string{"value"}).AddRow(tc.value))
+			current, err := migrationPassCompleteCurrent(context.Background(), db)
+			if err != nil {
+				t.Fatalf("migrationPassCompleteCurrent() error = %v, want nil", err)
+			}
+			if current {
+				t.Fatalf("migrationPassCompleteCurrent() = true for %q, want false", tc.value)
+			}
+		})
+	}
+}
+
+// A stamp from a NEWER binary must still satisfy this one, so mixed-binary
+// fleets stay monotonic instead of thrashing the sentinel.
+func TestMigrationPassCompleteCurrentAcceptsNewerStamp(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("create sql mock: %v", err)
+	}
+	defer db.Close()
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT value FROM local_metadata WHERE `key` = ?")).
+		WithArgs(migrationPassCompleteKey).
+		WillReturnRows(sqlmock.NewRows([]string{"value"}).
+			AddRow(fmt.Sprintf("%d/%d", LatestVersion()+5, LatestIgnoredVersion()+5)))
+	current, err := migrationPassCompleteCurrent(context.Background(), db)
+	if err != nil {
+		t.Fatalf("migrationPassCompleteCurrent() error = %v", err)
+	}
+	if !current {
+		t.Fatal("migrationPassCompleteCurrent() = false for a newer stamp, want true")
+	}
+}
+
+// expectPassSentinelCurrent matches a probe finding a complete-pass stamp at
+// this binary's versions.
+func expectPassSentinelCurrent(mock sqlmock.Sqlmock) {
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT value FROM local_metadata WHERE `key` = ?")).
+		WithArgs(migrationPassCompleteKey).
+		WillReturnRows(sqlmock.NewRows([]string{"value"}).
+			AddRow(fmt.Sprintf("%d/%d", LatestVersion(), LatestIgnoredVersion())))
+}
+
+// expectNoMigrationWork matches migrationWorkNeeded finding a fully current
+// database: both cursors at latest, both content-hash columns present, and the
+// custom statuses/types backfill already done.
+func expectNoMigrationWork(mock sqlmock.Sqlmock) {
+	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM schema_migrations", "version", LatestVersion())
+	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations", "version", LatestIgnoredVersion())
+	expectContentHashColumnExists(mock)
+	expectContentHashColumnExists(mock)
+	expectScalar(mock, "SELECT COUNT(*) FROM custom_types", "count", 1)
+	expectScalar(mock, "SELECT COUNT(*) FROM custom_statuses", "count", 1)
+}
+
+// expectPassSentinelAbsent matches MigrateUpWithLock's pre-lock currency probe
+// finding no sentinel row, so the open falls through to the locked pass.
+func expectPassSentinelAbsent(mock sqlmock.Sqlmock) {
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT value FROM local_metadata WHERE `key` = ?")).
+		WithArgs(migrationPassCompleteKey).
+		WillReturnRows(sqlmock.NewRows([]string{"value"}))
+}
+
+// expectPassSentinelRevoke matches the sentinel DELETE migrateUp issues before
+// the pass's first mutation.
+func expectPassSentinelRevoke(mock sqlmock.Sqlmock) {
+	mock.ExpectExec(regexp.QuoteMeta("DELETE FROM local_metadata WHERE `key` = ?")).
+		WithArgs(migrationPassCompleteKey).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+}
+
+// expectPassSentinelStamp matches the post-pass stamp: probe (absent), create
+// the clone-local table on demand, write the row.
+func expectPassSentinelStamp(mock sqlmock.Sqlmock) {
+	expectPassSentinelAbsent(mock)
+	mock.ExpectExec("(?s)^CREATE TABLE IF NOT EXISTS local_metadata").
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec(regexp.QuoteMeta("REPLACE INTO local_metadata (`key`, value) VALUES (?, ?)")).
+		WithArgs(migrationPassCompleteKey, sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
 }
 
 func expectColumnExists(mock sqlmock.Sqlmock, present bool) {

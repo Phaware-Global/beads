@@ -261,13 +261,36 @@ func MigrateUpTo(ctx context.Context, db DBConn, maxVersion int) (int, error) {
 	return applied, err
 }
 
+// MigrateUp brings the database fully current and, on success, stamps the
+// pass-completion sentinel that MigrateUpWithLock's lock-free fast path
+// requires. The stamp happens only after every part of the pass — migrations,
+// backfills, rekeys, ignored source, final commit — has returned, so a
+// concurrent prober can never fast-path into a half-finished pass; migrateUp
+// itself revokes the sentinel before its first mutation.
 func MigrateUp(ctx context.Context, db DBConn) (int, error) {
+	applied, err := migrateUp(ctx, db)
+	if err != nil {
+		return applied, err
+	}
+	return applied, ensureMigrationPassComplete(ctx, db)
+}
+
+func migrateUp(ctx context.Context, db DBConn) (int, error) {
 	needed, err := migrationWorkNeeded(ctx, db)
 	if err != nil {
 		return 0, fmt.Errorf("checking schema migration work: %w", err)
 	}
 	if !needed {
 		return 0, nil
+	}
+
+	// A pass is about to mutate the database. Revoke the fast path FIRST: from
+	// here until MigrateUp restamps the sentinel after a fully successful
+	// return, concurrent openers must queue on the migration lock — the pass's
+	// per-step commits make the other probe input true before the rekey tail
+	// and final commit have run.
+	if err := clearMigrationPassComplete(ctx, db); err != nil {
+		return 0, err
 	}
 
 	dirtyBeforeAll, err := dirtyTables(ctx, db, false)
@@ -472,6 +495,30 @@ func wispDependenciesNeed0053Repair(ctx context.Context, db DBConn) (bool, error
 		}
 	}
 	return false, nil
+}
+
+// migrationStateCurrent reports whether MigrateUp would be a complete no-op:
+// a complete pass has finished at this binary's versions (the sentinel — see
+// migrationPassCompleteKey) and no migration work is needed. It is strictly
+// read-only, so any number of concurrent processes can probe it without
+// coordination — the basis for MigrateUpWithLock's lock-free fast path.
+//
+// The sentinel check is first and is the concurrency barrier: migrationWorkNeeded
+// is satisfied mid-pass by a running migration's per-step commits (before its
+// rekey tail and final commit), so on its own it would admit a lock-free open
+// while another process's pass is still rewriting rows. migrationWorkNeeded
+// stays ANDed in because the sentinel alone cannot see out-of-band regressions
+// (a table copy that rewound the cursors leaves local_metadata untouched).
+func migrationStateCurrent(ctx context.Context, db DBConn) (bool, error) {
+	passComplete, err := migrationPassCompleteCurrent(ctx, db)
+	if err != nil || !passComplete {
+		return false, err
+	}
+	needed, err := migrationWorkNeeded(ctx, db)
+	if err != nil {
+		return false, err
+	}
+	return !needed, nil
 }
 
 func migrationWorkNeeded(ctx context.Context, db DBConn) (bool, error) {
