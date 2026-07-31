@@ -8,6 +8,7 @@ import (
 	"log"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 
 	"github.com/steveyegge/beads/internal/storage/dberrors"
@@ -28,18 +29,29 @@ import (
 // accepts; losing it for a transient read error is a needless blast radius.
 var sentinelUnwritable atomic.Bool
 
-// sentinelLogged caps stamp-related logging at one line per process, covering
-// EVERY branch. There is no log.SetOutput anywhere under cmd/ or internal/, so
-// the standard logger writes unfiltered to stderr on a CLI whose output is
-// machine-parsed; any un-capped log site on the steady-state open path is an
-// unbounded output leak, not just noise.
-var sentinelLogged atomic.Bool
+// sentinelLogged caps stamp-related logging, keyed BY MESSAGE rather than one
+// slot for the whole process. There is no log.SetOutput anywhere under cmd/ or
+// internal/, so the standard logger writes unfiltered to stderr on a CLI whose
+// output is machine-parsed; an un-capped log site on the steady-state open path
+// is an unbounded output leak. But a single global slot is the opposite error:
+// the first message consumed it and permanently silenced every other stamp
+// condition, including a different and more serious one on another database.
+// Per-message keying bounds the output (the format strings are compile-time
+// constants, so the key set is finite and small) while still surfacing each
+// distinct condition once.
+var sentinelLogged sync.Map
 
-// logSentinelOnce emits at most one stamp-related line for the process.
+// logSentinelOnce emits each distinct stamp-related message at most once per
+// process.
 func logSentinelOnce(format string, args ...any) {
-	if sentinelLogged.CompareAndSwap(false, true) {
+	if _, seen := sentinelLogged.LoadOrStore(format, true); !seen {
 		log.Printf(format, args...)
 	}
+}
+
+// resetSentinelLogged is test-only: clears the per-message log cap.
+func resetSentinelLogged() {
+	sentinelLogged.Range(func(k, _ any) bool { sentinelLogged.Delete(k); return true })
 }
 
 // sentinelWriteError marks a failure of the stamp write itself, as opposed to

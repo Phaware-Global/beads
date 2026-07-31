@@ -549,8 +549,8 @@ func TestSentinelWriteRefusalLatches(t *testing.T) {
 	}
 	defer db.Close()
 	sentinelUnwritable.Store(false)
-	sentinelLogged.Store(false)
-	t.Cleanup(func() { sentinelUnwritable.Store(false); sentinelLogged.Store(false) })
+	resetSentinelLogged()
+	t.Cleanup(func() { sentinelUnwritable.Store(false); resetSentinelLogged() })
 
 	// Mock BOTH opens fully, so an un-suppressed retry is free to proceed and
 	// will be counted rather than erroring out early.
@@ -602,8 +602,8 @@ func TestTransientWriteFailureDoesNotLatch(t *testing.T) {
 			}
 			defer db.Close()
 			sentinelUnwritable.Store(false)
-			sentinelLogged.Store(false)
-			t.Cleanup(func() { sentinelUnwritable.Store(false); sentinelLogged.Store(false) })
+			resetSentinelLogged()
+			t.Cleanup(func() { sentinelUnwritable.Store(false); resetSentinelLogged() })
 
 			expectNoMigrationWork(mock)
 			mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES`).
@@ -636,8 +636,8 @@ func TestSentinelReadFailureDoesNotLatch(t *testing.T) {
 	}
 	defer db.Close()
 	sentinelUnwritable.Store(false)
-	sentinelLogged.Store(false)
-	t.Cleanup(func() { sentinelUnwritable.Store(false); sentinelLogged.Store(false) })
+	resetSentinelLogged()
+	t.Cleanup(func() { sentinelUnwritable.Store(false); resetSentinelLogged() })
 
 	expectNoMigrationWork(mock)
 	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES`).
