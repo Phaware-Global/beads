@@ -304,7 +304,7 @@ func MigrateUp(ctx context.Context, db DBConn) (int, error) {
 //
 // A refused write is simply retried on the next open. There is deliberately no
 // attempt-suppression latch: classifying which driver errors are permanent
-// proved repeatedly wrong (this repo”'s own isRetryableError treats
+// proved repeatedly wrong (this repo's own isRetryableError treats
 // "database is read only" — the very condition such a latch was justified by —
 // as transient), and getting it wrong disabled the sentinel process-wide and
 // cross-database. The cost of retrying is one refused write per open on a

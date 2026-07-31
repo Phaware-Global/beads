@@ -549,6 +549,55 @@ func TestSentinelLoggingIsCappedPerMessage(t *testing.T) {
 	}
 }
 
+// Call-site coverage for the log cap: replacing logSentinelOnce with a bare
+// log.Printf in stampMigrationPassComplete must not go unnoticed. Two opens
+// against a persistently unstampable database may emit at most one line.
+func TestStampFailureLogsOncePerProcessAcrossOpens(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+	resetSentinelLogged()
+	t.Cleanup(resetSentinelLogged)
+
+	var buf bytes.Buffer
+	oldOut, oldFlags := log.Writer(), log.Flags()
+	log.SetOutput(&buf)
+	log.SetFlags(0)
+	t.Cleanup(func() { log.SetOutput(oldOut); log.SetFlags(oldFlags) })
+
+	for i := 0; i < 2; i++ {
+		expectNoMigrationWork(mock)
+		mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES`).
+			WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+		mock.ExpectQuery(regexp.QuoteMeta("SELECT COUNT(*) FROM local_metadata WHERE `key` = ?")).
+			WithArgs(auxRowRekeyInProgressKey).
+			WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+		expectPassSentinelAbsent(mock)
+		mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES`).
+			WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+		mock.ExpectExec(regexp.QuoteMeta("REPLACE INTO local_metadata")).
+			WillReturnError(errors.New("database is read only"))
+	}
+
+	for i := 0; i < 2; i++ {
+		if _, err := MigrateUp(context.Background(), db); err != nil {
+			t.Fatalf("MigrateUp() call %d error = %v", i+1, err)
+		}
+	}
+
+	lines := 0
+	for _, l := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
+		if strings.Contains(l, "migration pass sentinel") {
+			lines++
+		}
+	}
+	if lines != 1 {
+		t.Fatalf("sentinel log lines across 2 opens = %d, want 1; the cap must hold at the call site.\nlog:\n%s", lines, buf.String())
+	}
+}
+
 func TestStampSatisfiesRejectsTrailingGarbage(t *testing.T) {
 	good := fmt.Sprintf("%d/%d", LatestVersion(), LatestIgnoredVersion())
 	if !stampSatisfies(good) {
