@@ -309,15 +309,20 @@ func stampMigrationPassComplete(ctx context.Context, db DBConn) {
 	}
 	if resuming, err := auxRekeyResumePending(ctx, db); err != nil || resuming {
 		if err != nil {
-			log.Printf("schema: checking aux-rekey resume state before stamping migration pass sentinel (non-fatal): %v", err)
+			logSentinelOnce("schema: checking aux-rekey resume state before stamping migration pass sentinel (non-fatal): %v", err)
 		}
 		return
 	}
 	if err := ensureMigrationPassComplete(ctx, db); err != nil {
-		// Latch before logging so this is said once, not on every open forever.
-		if sentinelUnwritable.CompareAndSwap(false, true) {
-			log.Printf("schema: recording migration pass sentinel (non-fatal, will not retry this process): %v", err)
+		// Only a refused WRITE stops future attempts; the reads around it can
+		// fail transiently and must not disable the sentinel process-wide.
+		var writeErr *sentinelWriteError
+		if errors.As(err, &writeErr) {
+			sentinelUnwritable.Store(true)
+			logSentinelOnce("schema: recording migration pass sentinel (non-fatal, will not retry this process): %v", err)
+			return
 		}
+		logSentinelOnce("schema: recording migration pass sentinel (non-fatal): %v", err)
 	}
 }
 

@@ -1,9 +1,11 @@
 package schema
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"regexp"
 	"strings"
 	"testing"
@@ -520,10 +522,16 @@ func TestStampDoesNotMaterializeLocalMetadata(t *testing.T) {
 	}
 }
 
-// TestSentinelWriteRefusalLatches pins that a refused write is attempted once
-// per process, not on every open forever. Without the latch, deployments where
-// the write can never succeed would re-issue it and log to stderr on every
-// single bd invocation.
+// TestSentinelWriteRefusalLatches pins that a refused write is attempted and
+// logged once per process, not on every open forever.
+//
+// It asserts on LOG OUTPUT, not on mock expectations. An earlier version of
+// this test registered no sentinel expectation for the second open and claimed
+// "any retry shows up as an unexpected query" — it does not. go-sqlmock's
+// ExpectationsWereMet only reports UNFULFILLED expectations; it never records
+// unexpected calls, and MigrateUp swallows stamp errors by design, so the retry
+// was invisible and the test passed with the latch removed. Capturing the
+// logger is what makes the "at most once" contract observable.
 func TestSentinelWriteRefusalLatches(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
@@ -531,30 +539,81 @@ func TestSentinelWriteRefusalLatches(t *testing.T) {
 	}
 	defer db.Close()
 	sentinelUnwritable.Store(false)
-	t.Cleanup(func() { sentinelUnwritable.Store(false) })
+	sentinelLogged.Store(false)
+	t.Cleanup(func() { sentinelUnwritable.Store(false); sentinelLogged.Store(false) })
 
-	// First open: full stamp attempt, refused.
-	expectNoMigrationWork(mock)
-	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES`).
-		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
-	mock.ExpectQuery(regexp.QuoteMeta("SELECT COUNT(*) FROM local_metadata WHERE `key` = ?")).
-		WithArgs(auxRowRekeyInProgressKey).
-		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
-	expectPassSentinelAbsent(mock)
-	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES`).
-		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
-	mock.ExpectExec(regexp.QuoteMeta("REPLACE INTO local_metadata")).
-		WillReturnError(errors.New("database is read only"))
-	// Second open: ONLY the work probe. Any sentinel query here is unexpected.
-	expectNoMigrationWork(mock)
+	var logBuf bytes.Buffer
+	oldOut, oldFlags := log.Writer(), log.Flags()
+	log.SetOutput(&logBuf)
+	log.SetFlags(0)
+	t.Cleanup(func() { log.SetOutput(oldOut); log.SetFlags(oldFlags) })
+
+	// Both opens are fully mocked, so an un-latched retry is free to happen —
+	// and would show up as a second log line.
+	for i := 0; i < 2; i++ {
+		expectNoMigrationWork(mock)
+		mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES`).
+			WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+		mock.ExpectQuery(regexp.QuoteMeta("SELECT COUNT(*) FROM local_metadata WHERE `key` = ?")).
+			WithArgs(auxRowRekeyInProgressKey).
+			WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+		expectPassSentinelAbsent(mock)
+		mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES`).
+			WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+		mock.ExpectExec(regexp.QuoteMeta("REPLACE INTO local_metadata")).
+			WillReturnError(errors.New("database is read only"))
+	}
 
 	for i := 0; i < 2; i++ {
 		if _, err := MigrateUp(context.Background(), db); err != nil {
 			t.Fatalf("MigrateUp() call %d error = %v", i+1, err)
 		}
 	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Fatalf("unmet SQL expectations: %v", err)
+
+	// Count LINES, not substring hits: the message embeds the wrapped error, so
+	// the phrase appears more than once within a single line.
+	n := 0
+	for _, line := range strings.Split(strings.TrimSpace(logBuf.String()), "\n") {
+		if strings.Contains(line, "migration pass sentinel") {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Fatalf("sentinel log lines = %d, want exactly 1; a refused write must be logged once per process, not on every open.\nlog:\n%s", n, logBuf.String())
+	}
+	if !sentinelUnwritable.Load() {
+		t.Fatal("sentinelUnwritable = false after a refused write, want true")
+	}
+}
+
+// A read-side failure must NOT latch: it can be transient, and latching would
+// disable the sentinel for every database this process serves.
+func TestSentinelReadFailureDoesNotLatch(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+	sentinelUnwritable.Store(false)
+	sentinelLogged.Store(false)
+	t.Cleanup(func() { sentinelUnwritable.Store(false); sentinelLogged.Store(false) })
+
+	expectNoMigrationWork(mock)
+	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES`).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT COUNT(*) FROM local_metadata WHERE `key` = ?")).
+		WithArgs(auxRowRekeyInProgressKey).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+	// The stamp READ fails transiently.
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT value FROM local_metadata WHERE `key` = ?")).
+		WithArgs(migrationPassCompleteKey).
+		WillReturnError(errors.New("connection reset by peer"))
+
+	if _, err := MigrateUp(context.Background(), db); err != nil {
+		t.Fatalf("MigrateUp() error = %v", err)
+	}
+	if sentinelUnwritable.Load() {
+		t.Fatal("sentinelUnwritable = true after a transient READ failure; only a refused write may latch")
 	}
 }
 
