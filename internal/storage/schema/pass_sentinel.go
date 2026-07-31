@@ -9,25 +9,9 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 
 	"github.com/steveyegge/beads/internal/storage/dberrors"
 )
-
-// Two distinct mechanisms, deliberately separate — an earlier single latch
-// conflated them and was both too broad and too narrow.
-//
-// sentinelUnwritable stops further ATTEMPTS, and trips only on a refused stamp
-// WRITE (sentinelWriteError). On the deployments the best-effort stamp was
-// written for — Dolt read-only-under-load, or a bd user without CREATE — the
-// write can never succeed, so retrying it on every open is pure waste. It must
-// NOT trip on the reads around the write: those include conditions this file
-// deliberately tolerates elsewhere (a missing local_metadata) and transient
-// driver errors, and latching on them would disable the sentinel for every
-// database this process serves on the strength of one blip. Losing the stamp
-// for the process's lifetime costs one GET_LOCK per open, which the design
-// accepts; losing it for a transient read error is a needless blast radius.
-var sentinelUnwritable atomic.Bool
 
 // sentinelLogged caps stamp-related logging, keyed BY MESSAGE rather than one
 // slot for the whole process. There is no log.SetOutput anywhere under cmd/ or
@@ -53,13 +37,6 @@ func logSentinelOnce(format string, args ...any) {
 func resetSentinelLogged() {
 	sentinelLogged.Range(func(k, _ any) bool { sentinelLogged.Delete(k); return true })
 }
-
-// sentinelWriteError marks a failure of the stamp write itself, as opposed to
-// the reads around it. Only this kind latches sentinelUnwritable.
-type sentinelWriteError struct{ err error }
-
-func (e *sentinelWriteError) Error() string { return e.err.Error() }
-func (e *sentinelWriteError) Unwrap() error { return e.err }
 
 // migrationPassCompleteKey is the local_metadata row recording that, as of the
 // stamping binary's "main/ignored" latest versions, this database had no
@@ -198,7 +175,7 @@ func ensureMigrationPassComplete(ctx context.Context, db DBConn) error {
 		"REPLACE INTO local_metadata (`key`, value) VALUES (?, ?)",
 		migrationPassCompleteKey,
 		fmt.Sprintf("%d/%d", LatestVersion(), LatestIgnoredVersion())); err != nil {
-		return &sentinelWriteError{fmt.Errorf("recording migration pass sentinel: %w", err)}
+		return fmt.Errorf("recording migration pass sentinel: %w", err)
 	}
 	return nil
 }

@@ -302,26 +302,16 @@ func MigrateUp(ctx context.Context, db DBConn) (int, error) {
 // than "died inside the rekey tail" and the docs must not claim otherwise.
 // Closing it properly needs an in-progress marker for rekeyDependencyIDs.
 //
-// A refused write latches: see sentinelUnwritable.
-// durableWriteRefusal reports whether a refused stamp write is a standing
-// condition rather than a passing one. Only a standing refusal may latch: the
-// latch is process-global and cross-database, so a cancelled caller context or
-// the dolt-ignored-table recreate race (local_metadata briefly absent after a
-// server restart, branch checkout, or clone) must not disable the sentinel for
-// everything this process goes on to serve.
-func durableWriteRefusal(err error) bool {
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return false
-	}
-	// A missing table is exactly what the read and clear paths tolerate; the
-	// next open re-probes and simply declines to stamp.
-	return !dberrors.IsTableNotExist(err)
-}
-
+// A refused write is simply retried on the next open. There is deliberately no
+// attempt-suppression latch: classifying which driver errors are permanent
+// proved repeatedly wrong (this repo”'s own isRetryableError treats
+// "database is read only" — the very condition such a latch was justified by —
+// as transient), and getting it wrong disabled the sentinel process-wide and
+// cross-database. The cost of retrying is one refused write per open on a
+// deployment where it can never succeed, which is the same order as the
+// GET_LOCK the design already accepts. Log volume is bounded by
+// logSentinelOnce instead, which is the part that was actually unbounded.
 func stampMigrationPassComplete(ctx context.Context, db DBConn) {
-	if sentinelUnwritable.Load() {
-		return
-	}
 	if resuming, err := auxRekeyResumePending(ctx, db); err != nil || resuming {
 		if err != nil {
 			logSentinelOnce("schema: checking aux-rekey resume state before stamping migration pass sentinel (non-fatal): %v", err)
@@ -329,14 +319,6 @@ func stampMigrationPassComplete(ctx context.Context, db DBConn) {
 		return
 	}
 	if err := ensureMigrationPassComplete(ctx, db); err != nil {
-		// Only a refused WRITE stops future attempts; the reads around it can
-		// fail transiently and must not disable the sentinel process-wide.
-		var writeErr *sentinelWriteError
-		if errors.As(err, &writeErr) && durableWriteRefusal(err) {
-			sentinelUnwritable.Store(true)
-			logSentinelOnce("schema: recording migration pass sentinel (non-fatal, will not retry this process): %v", err)
-			return
-		}
 		logSentinelOnce("schema: recording migration pass sentinel (non-fatal): %v", err)
 	}
 }
