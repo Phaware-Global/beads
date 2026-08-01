@@ -816,16 +816,65 @@ func (m migrationSource) bootstrapSQL() string {
 }
 
 // hasContentHashColumn reports whether the cursor table already carries the
-// content_hash column. It probes INFORMATION_SCHEMA, so a not-yet-created table
-// simply reports false.
+// content_hash column. A not-yet-created table simply reports false.
+//
+// It probes a single table with SHOW COLUMNS rather than INFORMATION_SCHEMA.COLUMNS,
+// whose predicate Dolt does not push down.
+//
+// No LIKE clause: a cursor table has ~3 columns, so filtering client-side costs
+// nothing and avoids two hazards. '_' is a LIKE single-character wildcard, and —
+// the reason this matters — Dolt's server-side LIKE is case-sensitive while the
+// retired INFORMATION_SCHEMA predicate `COLUMN_NAME = 'content_hash'` used a
+// case-insensitive collation. Column names are case-insensitive identifiers in
+// MySQL/Dolt, so a table declaring `Content_Hash` is legitimate and every other
+// beads query against it keeps working; only this probe would have flipped to
+// false, sending ensureContentHashColumn into an ALTER that fails with
+// "column already exists" — a non-retryable error that permanently wedges every
+// store open. Hence EqualFold below, not ==.
 func (m migrationSource) hasContentHashColumn(ctx context.Context, db DBConn) (bool, error) {
-	var count int
-	if err := db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = 'content_hash'`,
-		m.cursorTable).Scan(&count); err != nil {
+	//nolint:gosec // G201: m.cursorTable is a hardcoded constant.
+	rows, err := db.QueryContext(ctx, "SHOW COLUMNS FROM "+m.cursorTable)
+	if err != nil {
+		// SHOW COLUMNS errors on a missing table; the old INFORMATION_SCHEMA
+		// probe returned count 0 instead. Preserve that: an absent cursor table
+		// has no content_hash column. MissingMigrationObjectErr rather than
+		// dberrors.IsTableNotExist because the embedded-Dolt driver surfaces the
+		// raw go-mysql-server "table not found: <name>" without the 1146 code
+		// that IsTableNotExist keys on.
+		if MissingMigrationObjectErr(err) {
+			return false, nil
+		}
 		return false, fmt.Errorf("checking %s.content_hash: %w", m.cursorTable, err)
 	}
-	return count > 0, nil
+	defer func() { _ = rows.Close() }()
+
+	cols, err := rows.Columns()
+	if err != nil {
+		return false, fmt.Errorf("checking %s.content_hash: %w", m.cursorTable, err)
+	}
+	// SHOW COLUMNS returns Field, Type, Null, Key, Default, Extra (and possibly
+	// more on some servers); scan every column into RawBytes and read the first
+	// ("Field"), which is the column name.
+	cells := make([]sql.RawBytes, len(cols))
+	dest := make([]any, len(cols))
+	for i := range cells {
+		dest[i] = &cells[i]
+	}
+	for rows.Next() {
+		if err := rows.Scan(dest...); err != nil {
+			return false, fmt.Errorf("checking %s.content_hash: %w", m.cursorTable, err)
+		}
+		// EqualFold, not ==: MySQL/Dolt column names are case-insensitive
+		// identifiers, and the retired INFORMATION_SCHEMA probe matched them
+		// case-insensitively.
+		if len(cells) > 0 && strings.EqualFold(string(cells[0]), "content_hash") {
+			return true, nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return false, fmt.Errorf("checking %s.content_hash: %w", m.cursorTable, err)
+	}
+	return false, nil
 }
 
 // ensureContentHashColumn adds the content_hash column to an existing cursor
