@@ -3,6 +3,7 @@ package schema
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"log"
@@ -595,6 +596,106 @@ func TestStampFailureLogsOncePerProcessAcrossOpens(t *testing.T) {
 	}
 	if lines != 1 {
 		t.Fatalf("sentinel log lines across 2 opens = %d, want 1; the cap must hold at the call site.\nlog:\n%s", lines, buf.String())
+	}
+}
+
+// countingConn wraps a DBConn and counts ExecContext calls matching a
+// substring, so a test can assert that a write did NOT happen. go-sqlmock
+// cannot: ExpectationsWereMet reports only UNFULFILLED expectations and never
+// records unexpected calls, and MigrateUp swallows stamp errors by design.
+type countingConn struct {
+	DBConn
+	match string
+	n     int
+}
+
+func (c *countingConn) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	if strings.Contains(query, c.match) {
+		c.n++
+	}
+	return c.DBConn.ExecContext(ctx, query, args...)
+}
+
+// The aux-probe branch of stampMigrationPassComplete has its own logSentinelOnce
+// call site. Without this, that site could be reverted to a bare log.Printf with
+// the whole package staying green — restoring per-open unbounded stderr on
+// exactly the deployments where the local_metadata read is persistently refused.
+func TestAuxProbeFailureLogsOncePerProcess(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+	resetSentinelLogged()
+	t.Cleanup(resetSentinelLogged)
+
+	var buf bytes.Buffer
+	oldOut, oldFlags := log.Writer(), log.Flags()
+	log.SetOutput(&buf)
+	log.SetFlags(0)
+	t.Cleanup(func() { log.SetOutput(oldOut); log.SetFlags(oldFlags) })
+
+	// Two opens where the aux-rekey probe itself fails.
+	for i := 0; i < 2; i++ {
+		expectNoMigrationWork(mock)
+		mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES`).
+			WillReturnError(errors.New("permission denied reading catalog"))
+	}
+
+	for i := 0; i < 2; i++ {
+		if _, err := MigrateUp(context.Background(), db); err != nil {
+			t.Fatalf("MigrateUp() call %d error = %v", i+1, err)
+		}
+	}
+
+	lines := 0
+	for _, l := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
+		if strings.Contains(l, "aux-rekey resume state") {
+			lines++
+		}
+	}
+	if lines != 1 {
+		t.Fatalf("aux-probe log lines across 2 opens = %d, want 1; the cap must hold at this call site too.\nlog:\n%s", lines, buf.String())
+	}
+}
+
+// The '|| resuming' carve-out: a database whose aux rekey tail died mid-flight
+// must NOT be stamped, because migrateUp's no-work short-circuit reports success
+// for it without executing that tail. Asserted by counting writes — dropping the
+// carve-out otherwise leaves the package green.
+func TestResumingAuxRekeyIsNotStamped(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+	resetSentinelLogged()
+	t.Cleanup(resetSentinelLogged)
+
+	// Unordered, and the REST of the stamp path is mocked to SUCCEED. That is
+	// what gives this test teeth: if the carve-out is dropped, the stamp runs to
+	// completion and issues the REPLACE, which the counter sees. Mocking only up
+	// to the marker would make the un-carved code merely error out on a missing
+	// expectation, and the swallowed error would look identical to success.
+	mock.MatchExpectationsInOrder(false)
+	expectNoMigrationWork(mock)
+	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES`).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT COUNT(*) FROM local_metadata WHERE `key` = ?")).
+		WithArgs(auxRowRekeyInProgressKey).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1)) // resuming
+	expectPassSentinelAbsent(mock)
+	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES`).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+	mock.ExpectExec(regexp.QuoteMeta("REPLACE INTO local_metadata")).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	conn := &countingConn{DBConn: db, match: "REPLACE INTO local_metadata"}
+	if _, err := MigrateUp(context.Background(), conn); err != nil {
+		t.Fatalf("MigrateUp() error = %v", err)
+	}
+	if conn.n != 0 {
+		t.Fatalf("stamp writes = %d, want 0; a database whose aux-rekey tail died mid-flight must not be certified", conn.n)
 	}
 }
 
