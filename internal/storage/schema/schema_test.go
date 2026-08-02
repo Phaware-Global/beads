@@ -61,10 +61,6 @@ func TestMigrateUpReturnsDirtyTablesErrorForPreExistingDirtyTable(t *testing.T) 
 	// ignoredSource.atLatest or the content-hash/backfill probes.
 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM schema_migrations", "version", 42)
 
-	// migrateUp revokes the pass-completion sentinel before its first mutation,
-	// so a concurrent prober cannot fast-path into this half-finished pass.
-	expectPassSentinelRevoke(mock)
-
 	// dirtyTables(ctx, db, false): `dependencies` has an uncommitted, unstaged
 	// change in the working set.
 	expectDirtyDoltStatusRow(mock, "dependencies", false)
