@@ -25,7 +25,19 @@ var updateCmd = &cobra.Command{
 	Long: `Update one or more issues.
 
 If no issue ID is provided, updates the last touched issue (from most recent
-create, update, show, or close operation).`,
+create, update, show, or close operation).
+
+For --notes, --append-notes-file, and --acceptance, prefer the -file
+variant (or "-" for stdin) over the inline flag whenever the text
+contains backticks, markdown code spans, or command substitution syntax.
+Inline text is exposed on the shell command line and can be executed by
+the shell before bd ever sees it.
+
+Example:
+  bd update gt-abc --append-notes-file - <<'EOF'
+  Findings: the scan command ran as ` + "`find / -name '*.log'`" + ` in prose,
+  which would execute if passed inline instead of via this heredoc.
+  EOF`,
 	Args:          cobra.MinimumNArgs(0),
 	SilenceUsage:  true,
 	SilenceErrors: true,

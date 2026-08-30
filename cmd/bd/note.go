@@ -17,13 +17,20 @@ var noteCmd = &cobra.Command{
 	Short:   "Append a note to an issue",
 	Long: `Append a note to an issue's notes field.
 
-Shorthand for 'bd update <id> --append-notes "text"'.
+Shorthand for 'bd update <id> --append-notes-file -'.
+
+Prefer --file/--stdin over positional text whenever the note contains
+backticks, markdown code spans, or command substitution syntax: inline
+text is exposed on the shell command line and can be executed by the
+shell before bd ever sees it.
 
 Examples:
   bd note gt-abc "Fixed the flaky test"
   bd note gt-abc Fixed the flaky test
-  echo "note from pipe" | bd note gt-abc --stdin
-  bd note gt-abc --file notes.txt`,
+  bd note gt-abc --file notes.txt
+  bd note gt-abc --file - <<'EOF'
+  Findings: the repro used a ` + "`rm -rf`" + ` in prose, quoted safely here.
+  EOF`,
 	Args:          cobra.MinimumNArgs(1),
 	SilenceUsage:  true,
 	SilenceErrors: true,

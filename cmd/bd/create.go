@@ -27,10 +27,23 @@ import (
 )
 
 var createCmd = &cobra.Command{
-	Use:           "create [title]",
-	GroupID:       "issues",
-	Aliases:       []string{"new"},
-	Short:         "Create a new issue (or batch from markdown/graph JSON)",
+	Use:     "create [title]",
+	GroupID: "issues",
+	Aliases: []string{"new"},
+	Short:   "Create a new issue (or batch from markdown/graph JSON)",
+	Long: `Create a new issue (or batch from markdown/graph JSON).
+
+For --notes, --append-notes, and --acceptance, prefer the -file variant
+(or "-" for stdin) over the inline flag whenever the text contains
+backticks, markdown code spans, or command substitution syntax. Inline
+text is exposed on the shell command line and can be executed by the
+shell before bd ever sees it.
+
+Example:
+  bd create "Fix flaky test" --acceptance-file - <<'EOF'
+  - CI passes 10x in a row
+  - No ` + "`eval`" + ` in the repro steps
+  EOF`,
 	Args:          cobra.MinimumNArgs(0),
 	SilenceUsage:  true,
 	SilenceErrors: true,

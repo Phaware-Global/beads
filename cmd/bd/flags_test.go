@@ -483,3 +483,271 @@ func TestGetDesignFlag(t *testing.T) {
 		}
 	})
 }
+
+// codeSpanRoundTrip is text containing a markdown code span wrapping a
+// command. Under the Claude Code Bash tool's `eval "... bd update ..."`
+// wrapper, passing this inline causes zsh to execute the enclosed command
+// via command substitution before bd ever sees it (gt-h38j). The -file
+// flags must round-trip it verbatim with no shell involvement.
+const codeSpanRoundTrip = "Findings: the scan ran as `find / -name '*.log'` and hung for 14h."
+
+func TestGetNotesFlag(t *testing.T) {
+	newCmd := func() *cobra.Command {
+		cmd := &cobra.Command{Use: "test", Run: func(cmd *cobra.Command, args []string) {}}
+		registerCommonIssueFlags(cmd)
+		return cmd
+	}
+
+	t.Run("InlineNotesFlag", func(t *testing.T) {
+		cmd := newCmd()
+		if err := cmd.ParseFlags([]string{"--notes", "inline notes"}); err != nil {
+			t.Fatalf("failed to parse flags: %v", err)
+		}
+		got, changed, err := getNotesFlag(cmd)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !changed {
+			t.Error("expected changed=true")
+		}
+		if got != "inline notes" {
+			t.Errorf("expected 'inline notes', got %q", got)
+		}
+	})
+
+	t.Run("NotesFileFlag_CodeSpanRoundTrip", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		filePath := filepath.Join(tmpDir, "notes.md")
+		if err := os.WriteFile(filePath, []byte(codeSpanRoundTrip), 0644); err != nil {
+			t.Fatalf("failed to write test file: %v", err)
+		}
+
+		cmd := newCmd()
+		if err := cmd.ParseFlags([]string{"--notes-file", filePath}); err != nil {
+			t.Fatalf("failed to parse flags: %v", err)
+		}
+		got, changed, err := getNotesFlag(cmd)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !changed {
+			t.Error("expected changed=true")
+		}
+		if got != codeSpanRoundTrip {
+			t.Errorf("expected verbatim round-trip %q, got %q", codeSpanRoundTrip, got)
+		}
+	})
+
+	t.Run("NotesFileStdin", func(t *testing.T) {
+		r, w, err := os.Pipe()
+		if err != nil {
+			t.Fatalf("failed to create pipe: %v", err)
+		}
+		oldStdin := os.Stdin
+		os.Stdin = r
+		t.Cleanup(func() { os.Stdin = oldStdin })
+
+		go func() {
+			w.WriteString(codeSpanRoundTrip)
+			w.Close()
+		}()
+
+		cmd := newCmd()
+		if err := cmd.ParseFlags([]string{"--notes-file", "-"}); err != nil {
+			t.Fatalf("failed to parse flags: %v", err)
+		}
+		got, changed, err := getNotesFlag(cmd)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !changed {
+			t.Error("expected changed=true")
+		}
+		if got != codeSpanRoundTrip {
+			t.Errorf("expected %q, got %q", codeSpanRoundTrip, got)
+		}
+	})
+
+	t.Run("NoFlagsSet", func(t *testing.T) {
+		cmd := newCmd()
+		if err := cmd.ParseFlags([]string{}); err != nil {
+			t.Fatalf("failed to parse flags: %v", err)
+		}
+		got, changed, err := getNotesFlag(cmd)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if changed {
+			t.Error("expected changed=false when no flags set")
+		}
+		if got != "" {
+			t.Errorf("expected empty string, got %q", got)
+		}
+	})
+
+	t.Run("MutualExclusionRegistered", func(t *testing.T) {
+		cmd := newCmd()
+		if cmd.Flags().Lookup("notes") == nil {
+			t.Fatal("expected --notes flag to be registered")
+		}
+		if cmd.Flags().Lookup("notes-file") == nil {
+			t.Fatal("expected --notes-file flag to be registered")
+		}
+		if err := cmd.ParseFlags([]string{"--notes", "a", "--notes-file", "b"}); err != nil {
+			t.Fatalf("failed to parse flags: %v", err)
+		}
+		if err := cmd.ValidateFlagGroups(); err == nil {
+			t.Fatal("expected error when both --notes and --notes-file are set")
+		}
+	})
+}
+
+func TestGetAppendNotesFlag(t *testing.T) {
+	newCmd := func() *cobra.Command {
+		cmd := &cobra.Command{Use: "test", Run: func(cmd *cobra.Command, args []string) {}}
+		registerCommonIssueFlags(cmd)
+		return cmd
+	}
+
+	t.Run("InlineAppendNotesFlag", func(t *testing.T) {
+		cmd := newCmd()
+		if err := cmd.ParseFlags([]string{"--append-notes", "inline append"}); err != nil {
+			t.Fatalf("failed to parse flags: %v", err)
+		}
+		got, changed, err := getAppendNotesFlag(cmd)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !changed {
+			t.Error("expected changed=true")
+		}
+		if got != "inline append" {
+			t.Errorf("expected 'inline append', got %q", got)
+		}
+	})
+
+	t.Run("AppendNotesFileFlag_CodeSpanRoundTrip", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		filePath := filepath.Join(tmpDir, "append-notes.md")
+		if err := os.WriteFile(filePath, []byte(codeSpanRoundTrip), 0644); err != nil {
+			t.Fatalf("failed to write test file: %v", err)
+		}
+
+		cmd := newCmd()
+		if err := cmd.ParseFlags([]string{"--append-notes-file", filePath}); err != nil {
+			t.Fatalf("failed to parse flags: %v", err)
+		}
+		got, changed, err := getAppendNotesFlag(cmd)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !changed {
+			t.Error("expected changed=true")
+		}
+		if got != codeSpanRoundTrip {
+			t.Errorf("expected verbatim round-trip %q, got %q", codeSpanRoundTrip, got)
+		}
+	})
+
+	t.Run("NoFlagsSet", func(t *testing.T) {
+		cmd := newCmd()
+		if err := cmd.ParseFlags([]string{}); err != nil {
+			t.Fatalf("failed to parse flags: %v", err)
+		}
+		got, changed, err := getAppendNotesFlag(cmd)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if changed {
+			t.Error("expected changed=false when no flags set")
+		}
+		if got != "" {
+			t.Errorf("expected empty string, got %q", got)
+		}
+	})
+
+	t.Run("MutualExclusionRegistered", func(t *testing.T) {
+		cmd := newCmd()
+		if err := cmd.ParseFlags([]string{"--append-notes", "a", "--append-notes-file", "b"}); err != nil {
+			t.Fatalf("failed to parse flags: %v", err)
+		}
+		if err := cmd.ValidateFlagGroups(); err == nil {
+			t.Fatal("expected error when both --append-notes and --append-notes-file are set")
+		}
+	})
+}
+
+func TestGetAcceptanceFlag(t *testing.T) {
+	newCmd := func() *cobra.Command {
+		cmd := &cobra.Command{Use: "test", Run: func(cmd *cobra.Command, args []string) {}}
+		registerCommonIssueFlags(cmd)
+		return cmd
+	}
+
+	t.Run("InlineAcceptanceFlag", func(t *testing.T) {
+		cmd := newCmd()
+		if err := cmd.ParseFlags([]string{"--acceptance", "inline acceptance"}); err != nil {
+			t.Fatalf("failed to parse flags: %v", err)
+		}
+		got, changed, err := getAcceptanceFlag(cmd)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !changed {
+			t.Error("expected changed=true")
+		}
+		if got != "inline acceptance" {
+			t.Errorf("expected 'inline acceptance', got %q", got)
+		}
+	})
+
+	t.Run("AcceptanceFileFlag_CodeSpanRoundTrip", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		filePath := filepath.Join(tmpDir, "acceptance.md")
+		if err := os.WriteFile(filePath, []byte(codeSpanRoundTrip), 0644); err != nil {
+			t.Fatalf("failed to write test file: %v", err)
+		}
+
+		cmd := newCmd()
+		if err := cmd.ParseFlags([]string{"--acceptance-file", filePath}); err != nil {
+			t.Fatalf("failed to parse flags: %v", err)
+		}
+		got, changed, err := getAcceptanceFlag(cmd)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !changed {
+			t.Error("expected changed=true")
+		}
+		if got != codeSpanRoundTrip {
+			t.Errorf("expected verbatim round-trip %q, got %q", codeSpanRoundTrip, got)
+		}
+	})
+
+	t.Run("NoFlagsSet", func(t *testing.T) {
+		cmd := newCmd()
+		if err := cmd.ParseFlags([]string{}); err != nil {
+			t.Fatalf("failed to parse flags: %v", err)
+		}
+		got, changed, err := getAcceptanceFlag(cmd)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if changed {
+			t.Error("expected changed=false when no flags set")
+		}
+		if got != "" {
+			t.Errorf("expected empty string, got %q", got)
+		}
+	})
+
+	t.Run("MutualExclusionRegistered", func(t *testing.T) {
+		cmd := newCmd()
+		if err := cmd.ParseFlags([]string{"--acceptance", "a", "--acceptance-file", "b"}); err != nil {
+			t.Fatalf("failed to parse flags: %v", err)
+		}
+		if err := cmd.ValidateFlagGroups(); err == nil {
+			t.Fatal("expected error when both --acceptance and --acceptance-file are set")
+		}
+	})
+}
