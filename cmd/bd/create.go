@@ -150,8 +150,14 @@ var createCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
-		acceptance, _ := cmd.Flags().GetString("acceptance")
-		notes, _ := cmd.Flags().GetString("notes")
+		acceptance, _, err := getAcceptanceFlag(cmd)
+		if err != nil {
+			return err
+		}
+		notes, _, err := getNotesFlag(cmd)
+		if err != nil {
+			return err
+		}
 		specID, _ := cmd.Flags().GetString("spec-id")
 
 		priorityStr, _ := cmd.Flags().GetString("priority")

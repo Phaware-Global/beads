@@ -135,9 +135,21 @@ func gatherCreateInput(cmd *cobra.Command, args []string) (createInput, error) {
 		return in, err
 	}
 	in.design = design
-	in.acceptanceCriteria, _ = cmd.Flags().GetString("acceptance")
-	in.notes, _ = cmd.Flags().GetString("notes")
-	in.appendNotes, _ = cmd.Flags().GetString("append-notes")
+	acceptance, _, err := getAcceptanceFlag(cmd)
+	if err != nil {
+		return in, err
+	}
+	in.acceptanceCriteria = acceptance
+	notes, _, err := getNotesFlag(cmd)
+	if err != nil {
+		return in, err
+	}
+	in.notes = notes
+	appendNotes, _, err := getAppendNotesFlag(cmd)
+	if err != nil {
+		return in, err
+	}
+	in.appendNotes = appendNotes
 	in.specID, _ = cmd.Flags().GetString("spec-id")
 
 	if in.markdownFile == "" && in.graphFile == "" {
@@ -269,7 +281,7 @@ var singleIssueOnlyFlags = []string{
 	"deps", "waits-for", "waits-for-gate",
 	"type", "priority", "assignee", "external-ref", "spec-id",
 	"description", "body", "message", "body-file", "description-file", "stdin",
-	"design", "design-file", "acceptance", "notes", "append-notes",
+	"design", "design-file", "acceptance", "acceptance-file", "notes", "notes-file", "append-notes", "append-notes-file",
 	"labels", "label", "skills", "context",
 	"event-category", "event-actor", "event-target", "event-payload",
 	"due", "defer",
