@@ -125,24 +125,34 @@ create, update, show, or close operation).`,
 		if designChanged {
 			updates["design"] = design
 		}
-		if cmd.Flags().Changed("notes") && cmd.Flags().Changed("append-notes") {
-			return HandleErrorRespectJSON("cannot specify both --notes and --append-notes")
+		notesRequested := cmd.Flags().Changed("notes") || cmd.Flags().Changed("notes-file")
+		appendNotesRequested := cmd.Flags().Changed("append-notes") || cmd.Flags().Changed("append-notes-file")
+		if notesRequested && appendNotesRequested {
+			return HandleErrorRespectJSON("cannot specify both --notes/--notes-file and --append-notes/--append-notes-file")
 		}
-		if cmd.Flags().Changed("notes") {
-			notes, _ := cmd.Flags().GetString("notes")
+		notes, notesChanged, err := getNotesFlag(cmd)
+		if err != nil {
+			return err
+		}
+		if notesChanged {
 			updates["notes"] = notes
 		}
-		if cmd.Flags().Changed("append-notes") {
-			appendNotes, _ := cmd.Flags().GetString("append-notes")
+		appendNotes, appendNotesChanged, err := getAppendNotesFlag(cmd)
+		if err != nil {
+			return err
+		}
+		if appendNotesChanged {
 			updates["append_notes"] = appendNotes
 		}
-		if cmd.Flags().Changed("acceptance") || cmd.Flags().Changed("acceptance-criteria") {
-			var acceptanceCriteria string
-			if cmd.Flags().Changed("acceptance") {
-				acceptanceCriteria, _ = cmd.Flags().GetString("acceptance")
-			} else {
-				acceptanceCriteria, _ = cmd.Flags().GetString("acceptance-criteria")
-			}
+		acceptanceCriteria, acceptanceChanged, err := getAcceptanceFlag(cmd)
+		if err != nil {
+			return err
+		}
+		if !acceptanceChanged && cmd.Flags().Changed("acceptance-criteria") {
+			acceptanceCriteria, _ = cmd.Flags().GetString("acceptance-criteria")
+			acceptanceChanged = true
+		}
+		if acceptanceChanged {
 			updates["acceptance_criteria"] = acceptanceCriteria
 		}
 		if cmd.Flags().Changed("external-ref") {
@@ -669,6 +679,7 @@ func init() {
 	updateCmd.Flags().String("spec-id", "", "Link to specification document")
 	updateCmd.Flags().String("acceptance-criteria", "", "DEPRECATED: use --acceptance")
 	_ = updateCmd.Flags().MarkHidden("acceptance-criteria") // Only fails if flag missing (caught in tests)
+	updateCmd.MarkFlagsMutuallyExclusive("acceptance-file", "acceptance-criteria")
 	updateCmd.Flags().IntP("estimate", "e", 0, "Time estimate in minutes (e.g., 60 for 1 hour)")
 	updateCmd.Flags().StringSlice("add-label", nil, "Add labels (repeatable)")
 	updateCmd.Flags().StringSlice("remove-label", nil, "Remove labels (repeatable)")

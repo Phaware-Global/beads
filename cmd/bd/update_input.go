@@ -86,24 +86,35 @@ func gatherUpdateInput(ctx context.Context, cmd *cobra.Command) *updateInput {
 	if designChanged {
 		in.fields["design"] = design
 	}
-	if cmd.Flags().Changed("notes") && cmd.Flags().Changed("append-notes") {
-		FatalErrorRespectJSON("cannot specify both --notes and --append-notes")
+	notesRequested := cmd.Flags().Changed("notes") || cmd.Flags().Changed("notes-file")
+	appendNotesRequested := cmd.Flags().Changed("append-notes") || cmd.Flags().Changed("append-notes-file")
+	if notesRequested && appendNotesRequested {
+		FatalErrorRespectJSON("cannot specify both --notes/--notes-file and --append-notes/--append-notes-file")
 	}
-	if cmd.Flags().Changed("notes") {
-		notes, _ := cmd.Flags().GetString("notes")
+	notes, notesChanged, err := getNotesFlag(cmd)
+	if err != nil {
+		FatalErrorRespectJSON("%v", err)
+	}
+	if notesChanged {
 		in.fields["notes"] = notes
 	}
-	if cmd.Flags().Changed("append-notes") {
-		in.appendNotes, _ = cmd.Flags().GetString("append-notes")
+	appendNotes, appendNotesChanged, err := getAppendNotesFlag(cmd)
+	if err != nil {
+		FatalErrorRespectJSON("%v", err)
+	}
+	if appendNotesChanged {
+		in.appendNotes = appendNotes
 		in.hasAppendNotes = true
 	}
-	if cmd.Flags().Changed("acceptance") || cmd.Flags().Changed("acceptance-criteria") {
-		var ac string
-		if cmd.Flags().Changed("acceptance") {
-			ac, _ = cmd.Flags().GetString("acceptance")
-		} else {
-			ac, _ = cmd.Flags().GetString("acceptance-criteria")
-		}
+	ac, acChanged, err := getAcceptanceFlag(cmd)
+	if err != nil {
+		FatalErrorRespectJSON("%v", err)
+	}
+	if !acChanged && cmd.Flags().Changed("acceptance-criteria") {
+		ac, _ = cmd.Flags().GetString("acceptance-criteria")
+		acChanged = true
+	}
+	if acChanged {
 		in.fields["acceptance_criteria"] = ac
 	}
 	if cmd.Flags().Changed("external-ref") {
