@@ -29,8 +29,14 @@ func registerCommonIssueFlags(cmd *cobra.Command) {
 	cmd.Flags().String("design-file", "", "Read design from file (use - for stdin)")
 	cmd.MarkFlagsMutuallyExclusive("design", "design-file")
 	cmd.Flags().String("acceptance", "", "Acceptance criteria")
+	cmd.Flags().String("acceptance-file", "", "Read acceptance criteria from file (use - for stdin)")
+	cmd.MarkFlagsMutuallyExclusive("acceptance", "acceptance-file")
 	cmd.Flags().String("notes", "", "Additional notes")
+	cmd.Flags().String("notes-file", "", "Read notes from file (use - for stdin)")
+	cmd.MarkFlagsMutuallyExclusive("notes", "notes-file")
 	cmd.Flags().String("append-notes", "", "Append to existing notes (with newline separator)")
+	cmd.Flags().String("append-notes-file", "", "Read notes to append from file (use - for stdin)")
+	cmd.MarkFlagsMutuallyExclusive("append-notes", "append-notes-file")
 	cmd.Flags().String("external-ref", "", "External reference (e.g., 'gh-9', 'jira-ABC', Linear URL)")
 }
 
@@ -177,6 +183,66 @@ func getDesignFlag(cmd *cobra.Command) (string, bool, error) {
 
 	if cmd.Flags().Changed("design") {
 		v, _ := cmd.Flags().GetString("design")
+		return v, true, nil
+	}
+
+	return "", false, nil
+}
+
+// getNotesFlag retrieves the notes value from --notes-file or --notes.
+// Returns the value, whether either flag was explicitly changed, and any error.
+func getNotesFlag(cmd *cobra.Command) (string, bool, error) {
+	if cmd.Flags().Changed("notes-file") {
+		path, _ := cmd.Flags().GetString("notes-file")
+		content, err := readBodyFile(path)
+		if err != nil {
+			return "", false, HandleError("reading notes file: %v", err)
+		}
+		return content, true, nil
+	}
+
+	if cmd.Flags().Changed("notes") {
+		v, _ := cmd.Flags().GetString("notes")
+		return v, true, nil
+	}
+
+	return "", false, nil
+}
+
+// getAppendNotesFlag retrieves the append-notes value from --append-notes-file or --append-notes.
+// Returns the value, whether either flag was explicitly changed, and any error.
+func getAppendNotesFlag(cmd *cobra.Command) (string, bool, error) {
+	if cmd.Flags().Changed("append-notes-file") {
+		path, _ := cmd.Flags().GetString("append-notes-file")
+		content, err := readBodyFile(path)
+		if err != nil {
+			return "", false, HandleError("reading append-notes file: %v", err)
+		}
+		return content, true, nil
+	}
+
+	if cmd.Flags().Changed("append-notes") {
+		v, _ := cmd.Flags().GetString("append-notes")
+		return v, true, nil
+	}
+
+	return "", false, nil
+}
+
+// getAcceptanceFlag retrieves the acceptance criteria value from --acceptance-file or --acceptance.
+// Returns the value, whether either flag was explicitly changed, and any error.
+func getAcceptanceFlag(cmd *cobra.Command) (string, bool, error) {
+	if cmd.Flags().Changed("acceptance-file") {
+		path, _ := cmd.Flags().GetString("acceptance-file")
+		content, err := readBodyFile(path)
+		if err != nil {
+			return "", false, HandleError("reading acceptance file: %v", err)
+		}
+		return content, true, nil
+	}
+
+	if cmd.Flags().Changed("acceptance") {
+		v, _ := cmd.Flags().GetString("acceptance")
 		return v, true, nil
 	}
 
