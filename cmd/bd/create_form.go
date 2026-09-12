@@ -10,6 +10,7 @@ import (
 
 	"charm.land/huh/v2"
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/beads/internal/beads"
 	"github.com/steveyegge/beads/internal/metrics"
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/types"
@@ -255,7 +256,7 @@ func CreateIssueFromFormValues(ctx context.Context, s storage.DoltStorage, fv *c
 		}
 	}
 
-	if err := verifyIssuesReadable(ctx, s, []string{issue.ID}); err != nil {
+	if err := verifyIssuesReadable(ctx, beads.FindBeadsDir(), []string{issue.ID}); err != nil {
 		return nil, err
 	}
 

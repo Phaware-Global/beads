@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/beads/internal/beads"
 	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/configfile"
 	"github.com/steveyegge/beads/internal/debug"
@@ -385,6 +386,11 @@ Example:
 
 		var targetStore storage.DoltStorage
 		var remoteCache *remotecache.Cache
+		// writeBeadsDir tracks the exact directory whose metadata.json
+		// configures the store this create writes through, so the post-create
+		// readback can re-resolve that same configured destination fresh
+		// rather than trusting the (possibly replaced) ambient store handle.
+		writeBeadsDir := beads.FindBeadsDir()
 		if !dryRun && repoPath != "." {
 			if remotecache.IsRemoteURL(repoPath) {
 				var err error
@@ -399,6 +405,11 @@ Example:
 				if err != nil {
 					return HandleError("failed to open remote store: %v", err)
 				}
+				// remotecache has no exported accessor for the local cache
+				// directory OpenStore just used; reproduce it purely (see
+				// remotecache.Cache.entryDir) rather than exposing new
+				// remotecache surface for this one readback call.
+				writeBeadsDir = filepath.Join(remoteCache.Dir, remotecache.CacheKey(repoPath))
 			} else {
 				targetBeadsDir := routing.ExpandPath(repoPath)
 				debug.Logf("DEBUG: Routing to target repo: %s\n", targetBeadsDir)
@@ -413,6 +424,7 @@ Example:
 				if err != nil {
 					return HandleError("failed to open target store: %v", err)
 				}
+				writeBeadsDir = targetBeadsDirPath
 			}
 
 			// Close the original store before replacing it (it won't be used anymore)
@@ -703,7 +715,7 @@ Example:
 			}
 		}
 
-		if err := verifyIssuesReadable(ctx, store, []string{issue.ID}); err != nil {
+		if err := verifyIssuesReadable(ctx, writeBeadsDir, []string{issue.ID}); err != nil {
 			return HandleError("%v", err)
 		}
 
@@ -726,6 +738,13 @@ Example:
 	},
 }
 
+// readbackStoreOpener opens a fresh, independently-configured store for a
+// beads directory. verifyIssuesReadable calls through this var (rather than
+// calling newReadOnlyStoreFromConfig directly) so tests can substitute a fake
+// that simulates a write landing somewhere other than the configured
+// destination, without touching real Dolt storage.
+var readbackStoreOpener = newReadOnlyStoreFromConfig
+
 // verifyIssuesReadable re-reads issues (or wisps — GetIssuesByIDs auto-routes
 // between the issues and wisps tables) immediately after a create reports
 // success and returns an error naming any that are not readable back from
@@ -735,11 +754,27 @@ Example:
 // persisted have gone unnoticed by every sweep, reaper, and query in the
 // system (hq-dzmd0). Success is a claim about persisted state, not about a
 // call returning without error.
-func verifyIssuesReadable(ctx context.Context, s storage.DoltStorage, ids []string) error {
+//
+// The readback deliberately does NOT reuse the store handle that performed
+// the write: that handle shares any misroute the write may have suffered
+// (bd-quc0). If a write lands somewhere other than the intended store, a
+// probe that shares the write's path would find the bead sitting where it
+// was wrongly written and report success on exactly the failure this check
+// exists to detect. Instead, this opens a fresh, read-only store resolved
+// from beadsDir's own metadata.json — the CONFIGURED destination — the same
+// shape bd-76s's dolt_mode check used to resolve the configured server
+// explicitly rather than trusting an ambient handle.
+func verifyIssuesReadable(ctx context.Context, beadsDir string, ids []string) error {
 	if len(ids) == 0 {
 		return nil
 	}
-	found, err := s.GetIssuesByIDs(ctx, ids)
+	configuredStore, err := readbackStoreOpener(ctx, beadsDir)
+	if err != nil {
+		return fmt.Errorf("post-create readback failed to open configured destination %s: %w", beadsDir, err)
+	}
+	defer func() { _ = configuredStore.Close() }()
+
+	found, err := configuredStore.GetIssuesByIDs(ctx, ids)
 	if err != nil {
 		return fmt.Errorf("post-create readback failed: %w", err)
 	}
@@ -754,7 +789,7 @@ func verifyIssuesReadable(ctx context.Context, s storage.DoltStorage, ids []stri
 		}
 	}
 	if len(missing) > 0 {
-		return fmt.Errorf("write reported success but %d issue(s) are not readable back from storage (write was dropped): %s", len(missing), strings.Join(missing, ", "))
+		return fmt.Errorf("write reported success but %d issue(s) are not readable back from the configured destination %s (write was dropped or misrouted): %s", len(missing), beadsDir, strings.Join(missing, ", "))
 	}
 	return nil
 }

@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/beads/internal/beads"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
 	"github.com/steveyegge/beads/internal/validation"
@@ -393,7 +394,7 @@ func createIssuesFromMarkdown(_ *cobra.Command, filepath string) error {
 	}
 	createdIssues = append(createdIssues, issues...)
 
-	if err := verifyIssuesReadable(ctx, store, issueIDs); err != nil {
+	if err := verifyIssuesReadable(ctx, beads.FindBeadsDir(), issueIDs); err != nil {
 		return HandleError("%v", err)
 	}
 

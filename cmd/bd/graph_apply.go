@@ -8,6 +8,7 @@ import (
 	"os"
 	"sort"
 
+	"github.com/steveyegge/beads/internal/beads"
 	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/types"
@@ -285,7 +286,7 @@ func createIssuesFromGraph(planFile string, dryRun bool, opts GraphApplyOptions)
 	for _, id := range result.IDs {
 		ids = append(ids, id)
 	}
-	if err := verifyIssuesReadable(rootCtx, store, ids); err != nil {
+	if err := verifyIssuesReadable(rootCtx, beads.FindBeadsDir(), ids); err != nil {
 		return HandleErrorRespectJSON("%v", err)
 	}
 
