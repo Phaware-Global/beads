@@ -281,6 +281,14 @@ func createIssuesFromGraph(planFile string, dryRun bool, opts GraphApplyOptions)
 		return HandleErrorRespectJSON("graph create: %v", err)
 	}
 
+	ids := make([]string, 0, len(result.IDs))
+	for _, id := range result.IDs {
+		ids = append(ids, id)
+	}
+	if err := verifyIssuesReadable(rootCtx, store, ids); err != nil {
+		return HandleErrorRespectJSON("%v", err)
+	}
+
 	if jsonOutput {
 		return outputJSON(result)
 	}

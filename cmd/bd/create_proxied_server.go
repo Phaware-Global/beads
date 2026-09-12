@@ -153,6 +153,10 @@ func runCreateProxiedSingle(_ *cobra.Command, ctx context.Context, in createInpu
 		FatalError("%v", err)
 	}
 
+	if err := verifyIssuesReadableProxied(ctx, []string{result.Issue.ID}, issue.Ephemeral); err != nil {
+		FatalError("%v", err)
+	}
+
 	switch {
 	case in.jsonOutput:
 		if err := outputJSON(result.Issue); err != nil {
@@ -165,6 +169,52 @@ func runCreateProxiedSingle(_ *cobra.Command, ctx context.Context, in createInpu
 		fmt.Printf("  Priority: P%d\n", result.Issue.Priority)
 		fmt.Printf("  Status: %s\n", result.Issue.Status)
 	}
+}
+
+// verifyIssuesReadableProxied re-reads issues (or wisps, per ephemeral)
+// through a freshly opened unit of work immediately after a proxied-server
+// create reports success, and returns an error naming any that are not
+// readable back from storage. This is a detector, not a fix: bd create must
+// not report success unless the bead it claims to have created is
+// subsequently readable — see verifyIssuesReadable in create.go for the full
+// rationale (hq-dzmd0).
+func verifyIssuesReadableProxied(ctx context.Context, ids []string, ephemeral bool) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	if uowProvider == nil {
+		return fmt.Errorf("proxied-server UOW provider not initialized")
+	}
+	uw, err := uowProvider.NewUOW(ctx)
+	if err != nil {
+		return fmt.Errorf("post-create readback failed to open storage: %w", err)
+	}
+	defer uw.Close(ctx)
+
+	var found []*types.Issue
+	if ephemeral {
+		found, err = uw.IssueUseCase().GetWispsByIDs(ctx, ids)
+	} else {
+		found, err = uw.IssueUseCase().GetIssuesByIDs(ctx, ids)
+	}
+	if err != nil {
+		return fmt.Errorf("post-create readback failed: %w", err)
+	}
+
+	foundSet := make(map[string]bool, len(found))
+	for _, issue := range found {
+		foundSet[issue.ID] = true
+	}
+	var missing []string
+	for _, id := range ids {
+		if !foundSet[id] {
+			missing = append(missing, id)
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("write reported success but %d issue(s) are not readable back from storage (write was dropped): %s", len(missing), strings.Join(missing, ", "))
+	}
+	return nil
 }
 
 func runCreateLintIssue(in createInput) {
@@ -306,6 +356,14 @@ func runCreateProxiedMarkdown(_ *cobra.Command, ctx context.Context, in createIn
 		FatalError("creating issues from markdown: %v", err)
 	}
 
+	ids := make([]string, 0, len(result.Issues))
+	for _, issue := range result.Issues {
+		ids = append(ids, issue.ID)
+	}
+	if err := verifyIssuesReadableProxied(ctx, ids, in.ephemeral); err != nil {
+		FatalError("%v", err)
+	}
+
 	if in.jsonOutput {
 		if err := outputJSON(result.Issues); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -414,6 +472,14 @@ func runCreateProxiedGraph(_ *cobra.Command, ctx context.Context, in createInput
 
 	if err := uw.Commit(ctx, commitMsg); err != nil && !isDoltNothingToCommit(err) {
 		FatalError("commit: %v", err)
+	}
+
+	ids := make([]string, 0, len(result.IDs))
+	for _, id := range result.IDs {
+		ids = append(ids, id)
+	}
+	if err := verifyIssuesReadableProxied(ctx, ids, in.ephemeral); err != nil {
+		FatalError("%v", err)
 	}
 
 	if in.jsonOutput {
