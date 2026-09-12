@@ -255,6 +255,10 @@ func CreateIssueFromFormValues(ctx context.Context, s storage.DoltStorage, fv *c
 		}
 	}
 
+	if err := verifyIssuesReadable(ctx, s, []string{issue.ID}); err != nil {
+		return nil, err
+	}
+
 	return issue, nil
 }
 

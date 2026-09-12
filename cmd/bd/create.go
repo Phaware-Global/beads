@@ -703,6 +703,10 @@ Example:
 			}
 		}
 
+		if err := verifyIssuesReadable(ctx, store, []string{issue.ID}); err != nil {
+			return HandleError("%v", err)
+		}
+
 		if jsonOutput {
 			if err := outputJSON(issue); err != nil {
 				return err
@@ -720,6 +724,39 @@ Example:
 		SetLastTouchedID(issue.ID)
 		return nil
 	},
+}
+
+// verifyIssuesReadable re-reads issues (or wisps — GetIssuesByIDs auto-routes
+// between the issues and wisps tables) immediately after a create reports
+// success and returns an error naming any that are not readable back from
+// storage. This is a detector, not a fix: bd create must not report success
+// unless the bead it claims to have created is subsequently readable, since
+// twelve confirmed instances of a write reported as successful but never
+// persisted have gone unnoticed by every sweep, reaper, and query in the
+// system (hq-dzmd0). Success is a claim about persisted state, not about a
+// call returning without error.
+func verifyIssuesReadable(ctx context.Context, s storage.DoltStorage, ids []string) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	found, err := s.GetIssuesByIDs(ctx, ids)
+	if err != nil {
+		return fmt.Errorf("post-create readback failed: %w", err)
+	}
+	foundSet := make(map[string]bool, len(found))
+	for _, issue := range found {
+		foundSet[issue.ID] = true
+	}
+	var missing []string
+	for _, id := range ids {
+		if !foundSet[id] {
+			missing = append(missing, id)
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("write reported success but %d issue(s) are not readable back from storage (write was dropped): %s", len(missing), strings.Join(missing, ", "))
+	}
+	return nil
 }
 
 type createIssueParams struct {
